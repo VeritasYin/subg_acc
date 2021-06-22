@@ -3,4 +3,4 @@ project(gather_op C)
 
 set(CMAKE_C_STANDARD 99)
 
-add_executable(gather_op test.c)
+add_executable(gather_op gcom_acc.c)
