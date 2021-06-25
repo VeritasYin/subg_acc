@@ -20,59 +20,6 @@ static PyObject *exe(PyObject *self, PyObject *args) {
     return PyLong_FromLong(sts);
 }
 
-
-static PyObject *gconcat(PyListObject *a, PyObject *bb) {
-    Py_ssize_t size;
-    Py_ssize_t i;
-    PyObject **src, **dest;
-    PyListObject *np;
-    if (a != NULL) {
-        size = Py_SIZE(a);
-    } else {
-        size = Py_SIZE(bb);
-    }
-
-#define b ((PyListObject *)bb)
-    if (2 * size > PY_SSIZE_T_MAX)
-        return PyErr_NoMemory();
-    np = (PyListObject *) PyList_New(2 * size);
-    if (np == NULL) {
-        return NULL;
-    }
-    dest = np->ob_item;
-    if (a != NULL) {
-        src = a->ob_item;
-        for (i = 0; i < size; i++) {
-            PyObject *v = src[i];
-            Py_INCREF(v);
-            dest[i] = v;
-        }
-    } else {
-        for (i = 0; i < size; i++) {
-            PyObject *v = PyLong_FromLong(0);
-            Py_INCREF(v);
-            dest[i] = v;
-        }
-    }
-    dest = np->ob_item + size;
-    if (b != NULL) {
-        src = b->ob_item;
-        for (i = 0; i < size; i++) {
-            PyObject *v = src[i];
-            Py_INCREF(v);
-            dest[i] = v;
-        }
-    } else {
-        for (i = 0; i < size; i++) {
-            PyObject *v = PyLong_FromLong(0);
-            Py_INCREF(v);
-            dest[i] = v;
-        }
-    }
-    return (PyObject *) np;
-#undef b
-}
-
 void pformat(PyListObject *a) {
     PyObject **item;
     if ((a != NULL) && PyList_Check(a)) {
@@ -86,12 +33,66 @@ void pformat(PyListObject *a) {
     }
 }
 
+static PyObject *mask(int size) {
+    PyListObject *nm = (PyListObject *) PyList_New(size);
+    PyObject **src;
+    src = nm->ob_item;
+    for (int i = 0; i < size; i++) {
+        PyObject *v = PyLong_FromLong(0);
+        Py_INCREF(v);
+        src[i] = v;
+    }
+    return (PyObject *) nm;
+}
 
-static PyObject *gather(PyObject *self, PyObject *args) {
-    PyObject *key1, *key2;
-    PyObject *dict = NULL;
-    if (!(PyArg_ParseTuple(args, "O!OO", &PyDict_Type, &dict, &key1, &key2))) {
-        PyErr_SetString(PyExc_TypeError, "parameter must be a dictionary.");
+static PyObject *gconcat(PyListObject *a, PyObject *bb) {
+    Py_ssize_t size;
+    PyObject **dest;
+    PyListObject *np;
+    if (a != NULL) {
+        size = Py_SIZE(a);
+    } else {
+        size = Py_SIZE(bb);
+    }
+
+//    pformat((PyListObject *) mask((int) size));
+
+    PyObject *defaults = mask((int) size);
+
+#define b ((PyListObject *)bb)
+    if (2 * size > PY_SSIZE_T_MAX)
+        return PyErr_NoMemory();
+    np = (PyListObject *) PyList_New(2);
+    if (np == NULL) {
+        return NULL;
+    }
+    dest = np->ob_item;
+
+    PyObject *va;
+    if (a != NULL) {
+        va = (PyObject *) a;
+    } else {
+        va = defaults;
+    }
+    Py_INCREF(va);
+    dest[0] = va;
+
+    PyObject *vb;
+    if (b != NULL) {
+        vb = (PyObject *) b;
+    } else {
+        vb = defaults;
+    }
+    Py_INCREF(vb);
+    dest[1] = vb;
+
+    return (PyObject *) np;
+#undef b
+}
+
+static PyObject *pair(PyObject *dict, PyObject *key1, PyObject *key2) {
+    if (!PyDict_Check(dict)) {
+        PyErr_SetString(PyExc_TypeError, "Input parameter must be two keys.");
         return NULL;
     }
 
@@ -132,13 +133,11 @@ static PyObject *gather(PyObject *self, PyObject *args) {
                 PyErr_SetString(PyExc_TypeError, "Keys must be integers.");
                 return NULL;
             } else {
-//                 printf("idx %i value %li ", i, PyLong_AsLong(pItem));
                 pValue1 = PyDict_GetItem(py_d1, pItem);
                 pValue2 = PyDict_GetItem(py_d2, pItem);
                 if ((pValue1 == NULL) && (pValue2 == NULL)) {
                     PyErr_SetString(PyExc_TypeError, "Keys must be existed in one dict.");
                     return NULL;
-//                    printf("[%li, %li]\n", PyLong_AsUnsignedLong(PyList_GetItem(pValue1, 1)), PyLong_AsUnsignedLong(PyList_GetItem(pValue2, 1)));
                 } else {
                     PyObject *v = gconcat((PyListObject *) pValue1, pValue2);
                     Py_INCREF(v);
@@ -155,10 +154,78 @@ static PyObject *gather(PyObject *self, PyObject *args) {
     }
 }
 
+// TODO add support to tuples
+
+static PyObject *gather(PyObject *self, PyObject *args) {
+    PyObject *pairs;
+    PyObject *dict = NULL;
+    PyObject **key;
+    if (!(PyArg_ParseTuple(args, "O!O", &PyDict_Type, &dict, &pairs))) {
+        PyErr_SetString(PyExc_TypeError, "Input parameter must be a pair of keys.");
+        return NULL;
+    }
+    if (PyList_Check(pairs)) {
+        key = ((PyListObject *) pairs)->ob_item;
+        return pair(dict, key[0], key[1]);
+    } else {
+        PyErr_SetString(PyExc_TypeError, "Type of keys error, must be a list.");
+        return NULL;
+    }
+}
+
+static PyObject *gathers(PyObject *self, PyObject *args) {
+    PyObject *pairs;
+    PyObject *dict = NULL;
+    PyObject **src, **dest, **key;
+    PyListObject *idx, *np;
+    Py_ssize_t size;
+    if (!(PyArg_ParseTuple(args, "O!O", &PyDict_Type, &dict, &pairs))) {
+        PyErr_SetString(PyExc_TypeError, "Input parameter must be a pair of keys.");
+        return NULL;
+    }
+
+    if (PyList_Check(pairs)) {
+        idx = (PyListObject *) pairs;
+        size = Py_SIZE(idx);
+        src = idx->ob_item;
+        np = (PyListObject *) PyList_New(size);
+        dest = np->ob_item;
+        if (!PyList_Check(src[0])) {
+            PyErr_SetString(PyExc_TypeError, "Input parameter must be a list of pairs.");
+            return NULL;
+        }
+        for (int i = 0; i < size; i++) {
+            PyObject *keys = src[i];
+            key = ((PyListObject *) keys)->ob_item;
+            PyObject *v = pair(dict, key[0], key[1]);
+            Py_IncRef(v);
+            dest[i] = v;
+        }
+        return (PyObject *) np;
+    } else {
+        PyErr_SetString(PyExc_TypeError, "Type of keys error, must be a list.");
+        return NULL;
+    }
+}
+
+static PyObject *gather_key(PyObject *self, PyObject *args) {
+    PyObject *key1, *key2;
+    PyObject *dict = NULL;
+
+    if (!(PyArg_ParseTuple(args, "O!OO", &PyDict_Type, &dict, &key1, &key2))) {
+        PyErr_SetString(PyExc_TypeError, "Input parameter must be two keys.");
+        return NULL;
+    }
+
+    return pair(dict, key1, key2);
+}
+
 static PyMethodDef GComMethods[] = {
-        {"add",    adds,   METH_VARARGS, "Add ops."},
-        {"gather", gather, METH_VARARGS, "Gather ops."},
-        {"run",    exe,    METH_VARARGS, "Execute a shell command."},
+        {"add",        adds,       METH_VARARGS, "Add ops."},
+        {"gather",     gather,     METH_VARARGS, "Gather op with a pair of keys."},
+        {"gathers",    gathers,    METH_VARARGS, "Gather op with a list of pairs."},
+        {"gather_key", gather_key, METH_VARARGS, "Gather op with two keys."},
+        {"run",        exe,        METH_VARARGS, "Execute a shell command."},
         {NULL, NULL, 0, NULL}
 };
 
