@@ -37,11 +37,11 @@ void py_format(PyListObject *PyList) {
     }
 }
 
-void f_format(int dim0, int dim1, int CArrays[][dim1]) {
-    for (int x = 0; x < dim0; x++) {
+void f_format(const npy_intp *dims, int *CArrays) {
+    for (int x = 0; x < dims[0]; x++) {
         printf("idx %d: \n", x);
-        for (int y = 0; y < dim1; y++) {
-            printf("%d ", CArrays[x][y]);
+        for (int y = 0; y < dims[1]; y++) {
+            printf("%d ", CArrays[x * dims[1] + y]);
         }
         printf("\n");
     }
@@ -102,11 +102,13 @@ static PyObject *psearch(PyObject *dict_u, PyObject *dict_v, PyObject *walks, in
     PyObject **src;
     src = ((PyListObject *) walks)->ob_item;
     int i;
-    int CArrays[size][len * 2];
-    memset(CArrays, 0, sizeof(int) * size * len * 2);
+    npy_intp dims[2] = {size, len * 2};
+    PyArrayObject *PyArray = (PyArrayObject *) PyArray_ZEROS(2, dims, NPY_INT, 0);
+    int *pA = (int *) PyArray_DATA(PyArray);
+
     omp_set_num_threads(10);
 
-#pragma omp parallel for private(i) shared(CArrays)
+#pragma omp parallel for private(i) shared(PyArray)
     for (i = 0; i < size; i++) {
         PyObject *pValue1, *pValue2, *pItem;
         pItem = src[i];
@@ -115,25 +117,22 @@ static PyObject *psearch(PyObject *dict_u, PyObject *dict_v, PyObject *walks, in
 
         if (pValue1 != NULL) {
             for (int j = 0; j < len; j++) {
-                CArrays[i][j] = (int) PyLong_AsLong(PyList_GetItem(pValue1, j));
+                pA[i * dims[1] + j] = (int) PyLong_AsLong(PyList_GetItem(pValue1, j));
             }
         }
 
         if (pValue2 != NULL) {
             for (int j = 0; j < len; j++) {
-                CArrays[i][j + len] = (int) PyLong_AsLong(PyList_GetItem(pValue2, j));
+                pA[i * dims[1] + j + len] = (int) PyLong_AsLong(PyList_GetItem(pValue2, j));
             }
         }
     }
 
     if (DEBUG) {
-        f_format(size, 2*len, CArrays);
+        f_format(dims, pA);
     }
 
-    npy_intp Dims[2] = {size, len * 2};
-    PyObject *PyArray = PyArray_SimpleNewFromData(2, Dims, NPY_INT, CArrays);
-    PyArray_ENABLEFLAGS((PyArrayObject *) PyArray, NPY_ARRAY_OWNDATA);
-    return PyArray;
+    return PyArray_Return(PyArray);
 }
 
 
