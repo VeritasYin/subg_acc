@@ -2,6 +2,9 @@
 
 #include </Users/veritas/opt/anaconda3/include/python3.8/Python.h>
 #include </Users/veritas/opt/anaconda3/lib/python3.8/site-packages/numpy/core/include/numpy/arrayobject.h>
+#include </Users/veritas/opt/anaconda3/include/omp.h>
+
+#define DEBUG 1
 
 static PyObject *adds(PyObject *self, PyObject *args) {
     int arg1, arg2;
@@ -21,18 +24,6 @@ static PyObject *exe(PyObject *self, PyObject *args) {
     return PyLong_FromLong(sts);
 }
 
-static PyObject *mask(int size) {
-    PyListObject *nm = (PyListObject *) PyList_New(size);
-    PyObject **src;
-    src = nm->ob_item;
-    for (int i = 0; i < size; i++) {
-        PyObject *v = PyLong_FromLong(0);
-        Py_INCREF(v);
-        src[i] = v;
-    }
-    return (PyObject *) nm;
-}
-
 void py_format(PyListObject *PyList) {
     PyObject **item;
     if ((PyList != NULL) && PyList_Check(PyList)) {
@@ -46,7 +37,7 @@ void py_format(PyListObject *PyList) {
     }
 }
 
-void f_format(int *CArrays[], int dim0, int dim1) {
+void f_format(int dim0, int dim1, int CArrays[][dim1]) {
     for (int x = 0; x < dim0; x++) {
         printf("idx %d: \n", x);
         for (int y = 0; y < dim1; y++) {
@@ -110,11 +101,13 @@ static PyObject *psearch(PyObject *dict_u, PyObject *dict_v, PyObject *walks, in
     Py_ssize_t size = PyList_Size(walks);
     PyObject **src;
     src = ((PyListObject *) walks)->ob_item;
+    int i;
     int CArrays[size][len * 2];
     memset(CArrays, 0, sizeof(int) * size * len * 2);
+    omp_set_num_threads(10);
 
-#pragma omp parallel for private(i)
-    for (int i = 0; i < size; i++) {
+#pragma omp parallel for private(i) shared(CArrays)
+    for (i = 0; i < size; i++) {
         PyObject *pValue1, *pValue2, *pItem;
         pItem = src[i];
         pValue1 = PyDict_GetItem(dict_u, pItem);
@@ -131,6 +124,10 @@ static PyObject *psearch(PyObject *dict_u, PyObject *dict_v, PyObject *walks, in
                 CArrays[i][j + len] = (int) PyLong_AsLong(PyList_GetItem(pValue2, j));
             }
         }
+    }
+
+    if (DEBUG) {
+        f_format(size, 2*len, CArrays);
     }
 
     npy_intp Dims[2] = {size, len * 2};
@@ -150,13 +147,13 @@ static PyObject *search(PyObject *dict_u, PyObject *dict_v, PyObject *walks) {
     for (int i = 0; i < size; i++) {
         pItem = src[i];
         if (!PyLong_Check(pItem)) {
-            PyErr_SetString(PyExc_TypeError, "Keys must be integers.");
+            PyErr_SetString(PyExc_TypeError, "Type of keys error: must be integers.");
             return NULL;
         } else {
             pValue1 = PyDict_GetItem(dict_u, pItem);
             pValue2 = PyDict_GetItem(dict_v, pItem);
             if ((pValue1 == NULL) && (pValue2 == NULL)) {
-                PyErr_SetString(PyExc_TypeError, "Keys must be existed in the given dict.");
+                PyErr_SetString(PyExc_TypeError, "Query keys error: not found in parsed dict.");
                 return NULL;
             } else {
                 PyObject *v = gconcat((PyListObject *) pValue1, pValue2);
@@ -208,74 +205,43 @@ static PyObject *assemble(PyObject *dict, PyObject *key1, PyObject *key2, int nj
 
 static PyObject *pgather(PyObject *self, PyObject *args, PyObject *kw) {
     PyObject *dict = NULL;
-    PyObject *pair;
+    PyObject *pairs;
     int njobs = -1;
     static char *kwlist[] = {"dict", "pair", "njobs", NULL};
-    if (!(PyArg_ParseTupleAndKeywords(args, kw, "O!O|i", kwlist, &PyDict_Type, &dict, &pair, &njobs))) {
+    if (!(PyArg_ParseTupleAndKeywords(args, kw, "O!O|i", kwlist, &PyDict_Type, &dict, &pairs, &njobs))) {
         PyErr_SetString(PyExc_TypeError, "Invalid input parameters, must be a pair of keys.");
         return NULL;
     }
 
     PyObject **key;
-    if (PyList_Check(pair)) {
-        key = ((PyListObject *) pair)->ob_item;
-        return assemble(dict, key[0], key[1], njobs);
-    } else {
-        PyErr_SetString(PyExc_TypeError, "Type of keys error, must be a list.");
-        return NULL;
-    }
-}
-
-static PyObject *gather(PyObject *self, PyObject *args) {
-    PyObject *pair;
-    PyObject *dict = NULL;
-    PyObject **key;
-    if (!(PyArg_ParseTuple(args, "O!O", &PyDict_Type, &dict, &pair))) {
-        PyErr_SetString(PyExc_TypeError, "Input parameter must be a pair of keys.");
-        return NULL;
-    }
-    if (PyList_Check(pair)) {
-        key = ((PyListObject *) pair)->ob_item;
-        return assemble(dict, key[0], key[1], 0);
-    } else {
-        PyErr_SetString(PyExc_TypeError, "Type of keys error, must be a list.");
-        return NULL;
-    }
-}
-
-static PyObject *gathers(PyObject *self, PyObject *args) {
-    PyObject *pairs;
-    PyObject *dict = NULL;
-    PyObject **src, **dest, **key;
-    PyListObject *idx, *np;
-    Py_ssize_t size;
-
-    if (!(PyArg_ParseTuple(args, "O!O", &PyDict_Type, &dict, &pairs))) {
-        PyErr_SetString(PyExc_TypeError, "Input parameter must be a pair of keys.");
-        return NULL;
-    }
-
     if (PyList_Check(pairs)) {
-        idx = (PyListObject *) pairs;
-        size = Py_SIZE(idx);
-        src = idx->ob_item;
-        if (!PyList_Check(src[0])) {
-            PyErr_SetString(PyExc_TypeError, "The element of the input list must be a list.");
-            return NULL;
-        } else {
+        PyObject *tmp = PyList_GetItem(pairs, 0);
+        if (PyLong_Check(tmp)) {
+            key = ((PyListObject *) pairs)->ob_item;
+            return assemble(dict, key[0], key[1], njobs);
+        } else if (PyList_Check(tmp)) {
+            PyObject **src, **dest;
+            PyListObject *idx, *np;
+            Py_ssize_t size;
+            idx = (PyListObject *) pairs;
+            size = Py_SIZE(idx);
+            src = idx->ob_item;
+
             np = (PyListObject *) PyList_New(size);
             dest = np->ob_item;
             for (int i = 0; i < size; i++) {
-                PyObject *keys = src[i];
-                key = ((PyListObject *) keys)->ob_item;
-                PyObject *v = assemble(dict, key[0], key[1], 0);
+                key = ((PyListObject *) src[i])->ob_item;
+                PyObject *v = assemble(dict, key[0], key[1], njobs);
                 Py_IncRef(v);
                 dest[i] = v;
             }
             return (PyObject *) np;
+        } else {
+            PyErr_SetString(PyExc_TypeError, "Type of query must be a pair or list of pairs.");
+            return NULL;
         }
     } else {
-        PyErr_SetString(PyExc_TypeError, "The input must be a list of pairs.");
+        PyErr_SetString(PyExc_TypeError, "Type of input must be a list.");
         return NULL;
     }
 }
@@ -294,9 +260,7 @@ static PyObject *gather_key(PyObject *self, PyObject *args) {
 
 static PyMethodDef GComMethods[] = {
         {"add",        adds,                  METH_VARARGS, "Add ops."},
-        {"gather",     gather,                METH_VARARGS, "Gather op with a pair of keys."},
-        {"pgather",    (PyCFunction) pgather, METH_VARARGS | METH_KEYWORDS, "Gather op with a list of pairs (openmp)."},
-        {"gathers",    gathers,               METH_VARARGS, "Gather op with a list of pairs."},
+        {"gather",     (PyCFunction) pgather, METH_VARARGS | METH_KEYWORDS, "Gather op with a list of pairs (openmp)."},
         {"gather_key", gather_key,            METH_VARARGS, "Gather op with two keys."},
         {"run",        exe,                   METH_VARARGS, "Execute a shell command."},
         {NULL, NULL, 0,                                                     NULL}
@@ -314,5 +278,6 @@ static struct PyModuleDef gcommodule = {
 };
 
 PyMODINIT_FUNC PyInit_gcom_acc(void) {
+    import_array();
     return PyModule_Create(&gcommodule);
 }
