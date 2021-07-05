@@ -146,13 +146,13 @@ static PyObject *search(PyObject *dict_u, PyObject *dict_v, PyObject *walks) {
     for (int i = 0; i < size; i++) {
         pItem = src[i];
         if (!PyLong_Check(pItem)) {
-            PyErr_SetString(PyExc_TypeError, "Type of keys error: must be integers.");
+            PyErr_SetString(PyExc_TypeError, "Key type error: must be integers.");
             return NULL;
         } else {
             pValue1 = PyDict_GetItem(dict_u, pItem);
             pValue2 = PyDict_GetItem(dict_v, pItem);
             if ((pValue1 == NULL) && (pValue2 == NULL)) {
-                PyErr_SetString(PyExc_TypeError, "Query keys error: not found in parsed dict.");
+                PyErr_SetString(PyExc_TypeError, "Query key error: not found in parsed dictionary.");
                 return NULL;
             } else {
                 PyObject *v = gconcat((PyListObject *) pValue1, pValue2);
@@ -174,7 +174,7 @@ static PyObject *assemble(PyObject *dict, PyObject *key1, PyObject *key2, int nj
     PyObject *py_v2 = PyDict_GetItem(dict, key2);
 
     if ((py_v1 == NULL) || (py_v2 == NULL)) {
-        PyErr_SetString(PyExc_TypeError, "Missed key in given dictionary.");
+        PyErr_SetString(PyExc_TypeError, "Missed key in parsed dictionary.");
         return NULL;
     }
 
@@ -208,7 +208,7 @@ static PyObject *pgather(PyObject *self, PyObject *args, PyObject *kw) {
     int njobs = -1;
     static char *kwlist[] = {"dict", "pair", "njobs", NULL};
     if (!(PyArg_ParseTupleAndKeywords(args, kw, "O!O|i", kwlist, &PyDict_Type, &dict, &pairs, &njobs))) {
-        PyErr_SetString(PyExc_TypeError, "Invalid input parameters, must be a pair of keys.");
+        PyErr_SetString(PyExc_TypeError, "Input must be a pair of keys.");
         return NULL;
     }
 
