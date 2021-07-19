@@ -90,6 +90,7 @@ static void f_format(const npy_intp *dims, int *CArrays) {
 static void
 random_walk(int const *ptr, int const *neighs, int const *seq, int n, int num_walks, int num_steps, int seed,
             int nthread, int *walks) {
+    /* https://github.com/lkskstlr/rwalk */
     if (DEBUG) {
         printf("get in  with n: %d, num_walks: %d, num_steps: %d, seed: %d, nthread: %d\n", n, num_walks, num_steps,
                seed, nthread);
@@ -138,6 +139,7 @@ random_walk_wo(int const *ptr, int const *neighs, int const *seq, int n, int num
             int num_hop1 = ptr[seq[i] + 1] - ptr[seq[i]];
             int rseq[num_hop1];
             if (num_hop1 > num_walks) {
+                // https://www.programmersought.com/article/71554044511/
                 int s, t;
                 for (int j = 0; j < num_hop1; j++)
                     rseq[j] = j;
@@ -153,7 +155,10 @@ random_walk_wo(int const *ptr, int const *neighs, int const *seq, int n, int num
                 int curr = seq[i];
                 offset = i * num_walks * (num_steps + 1) + walk * (num_steps + 1);
                 walks[offset] = curr;
-                if (num_hop1 <= num_walks) {
+                if (num_hop1 < 1){
+                    walks[offset + 1] = curr;
+                }
+                else if (num_hop1 <= num_walks) {
                     curr = neighs[ptr[curr] + walk % num_hop1];
                     walks[offset + 1] = curr;
                 } else {
@@ -238,8 +243,7 @@ static PyObject *np_walk(PyObject *self, PyObject *args, PyObject *kws) {
     int num_walks = 100, num_steps = 3, seed = 111413, nthread = -1, re = -1;
     int n;
 
-    static char *kwlist[] = {"ptr", "neighs", "query", "num_walks", "num_steps", "nthread", "seed", "replacement",
-                             NULL};
+    static char *kwlist[] = {"ptr", "neighs", "query", "num_walks", "num_steps", "nthread", "seed", "replacement", NULL};
     if (!(PyArg_ParseTupleAndKeywords(args, kws, "OOO|iiiip", kwlist, &arg1, &arg2, &query, &num_walks, &num_steps,
                                       &nthread, &seed, &re))) {
         PyErr_SetString(PyExc_TypeError, "input parsing error.");
@@ -274,10 +278,10 @@ static PyObject *np_walk(PyObject *self, PyObject *args, PyObject *kws) {
     PyArrayObject **Cobj_arr = PyArray_DATA(obj_arr);
 
     if (re > 0) {
-        random_walk(Cptr, Cneighs, Cseq, n, num_walks, num_steps, seed, nthread, Coarr);
-    } else {
-        printf("Using no replacement sampling for the 1-hop.\n");
+//         printf("Using no replacement sampling for the 1-hop.\n");
         random_walk_wo(Cptr, Cneighs, Cseq, n, num_walks, num_steps, seed, nthread, Coarr);
+    } else {
+        random_walk(Cptr, Cneighs, Cseq, n, num_walks, num_steps, seed, nthread, Coarr);
     }
 
     int k;
@@ -321,7 +325,6 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
     } else {
         stride = (int) arr1_dims[1];
     }
-
     int *Carr = (int *) PyArray_DATA(arr);
 
     /* handle keys (a list of tuple) */
@@ -358,7 +361,6 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
         HASH_ADD_INT(items, key, k);
 
         PyObject *item = PySequence_Fast(src[i], "argument must be iterable");
-
         int item_size;
         if (!PyArray_CheckExact(item)) {
             item_size = PySequence_Fast_GET_SIZE(item);
@@ -378,7 +380,7 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
             for (int j = 0; j < item_size; j++) {
                 /* add a sub hash table off this element */
                 dict_item *w = malloc(sizeof(*w));
-                w->key = (*(int *) PyArray_GETPTR1(item, j));
+                w->key = (*(int *) PyArray_GETPTR1((PyArrayObject *)item, j));
                 w->sub = NULL;
                 w->val = idx;
                 HASH_ADD_INT(k->sub, key, w);
