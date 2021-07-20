@@ -1,7 +1,6 @@
 #define PY_SSIZE_T_CLEAN
-
+/* gcc/8.3.0, OPENMP 201511 */
 #include "utils.h"
-
 #include "uthash.h"
 
 #define DEBUG 0
@@ -13,7 +12,7 @@ typedef struct item_int {
 } dict_int;
 
 static int find_key_int(dict_int *maps, int key) {
-    struct item_int *s;
+    dict_int *s;
     HASH_FIND_INT(maps, &key, s);  /* s: output pointer */
     return s ? s->val : -1;
 }
@@ -26,16 +25,14 @@ typedef struct item {
     UT_hash_handle hh;
 } dict_item;
 
-dict_item *items = NULL;
-
-static int find_key(int key) {
-    struct item *s;
+static int find_key_item(dict_item *items, int key) {
+    dict_item *s;
     HASH_FIND_INT(items, &key, s);  /* s: output pointer */
     return s ? s->val : -1;
 }
 
-static int find_idx(int id1, int id2) {
-    struct item *s, *p;
+static int find_idx(dict_item *items, int id1, int id2) {
+    dict_item *s, *p;
     HASH_FIND_INT(items, &id1, s);  /* s: output pointer */
     if (s != NULL) {
         HASH_FIND_INT(s->sub, &id2, p);
@@ -45,16 +42,16 @@ static int find_idx(int id1, int id2) {
     }
 }
 
-void delete_all(void) {
+void delete_all(dict_item *maps) {
     dict_item *item1, *item2, *tmp1, *tmp2;
 
     /* clean up both hash tables */
-    HASH_ITER(hh, items, item1, tmp1) {
+    HASH_ITER(hh, maps, item1, tmp1) {
         HASH_ITER(hh, item1->sub, item2, tmp2) {
             HASH_DEL(item1->sub, item2);
             free(item2);
         }
-        HASH_DEL(items, item1);
+        HASH_DEL(maps, item1);
         free(item1);
     }
 }
@@ -284,16 +281,15 @@ static PyObject *np_walk(PyObject *self, PyObject *args, PyObject *kws) {
         random_walk(Cptr, Cneighs, Cseq, n, num_walks, num_steps, seed, nthread, Coarr);
     }
 
-    int k;
-#pragma omp for private(k)
-    for (k = 0; k < n; k++) {
+#pragma omp for
+    for (int k = 0; k < n; k++) {
         dis_encoding(Coarr, k, num_walks, num_steps, Cobj_arr);
     }
 
     Py_DECREF(ptr);
     Py_DECREF(neighs);
     Py_DECREF(seq);
-    return Py_BuildValue("[O,O]", PyArray_Return(oarr), PyArray_Return(obj_arr));
+    return Py_BuildValue("[N,N]", PyArray_Return(oarr), PyArray_Return(obj_arr));
 
     fail:
     Py_XDECREF(ptr);
@@ -318,19 +314,19 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
     /* handle walks (numpy array) */
     arr = (PyArrayObject *) PyArray_FROM_OTF(arg1, NPY_INT, NPY_ARRAY_IN_ARRAY);
     if (!arr) return NULL;
-    npy_intp *arr1_dims = PyArray_DIMS(arr);
+    npy_intp *arr_dims = PyArray_DIMS(arr);
     int stride;
     if (PyArray_NDIM(arr) > 2) {
-        stride = (int) (arr1_dims[1] * arr1_dims[2]);
+        stride = (int) (arr_dims[1] * arr_dims[2]);
     } else {
-        stride = (int) arr1_dims[1];
+        stride = (int) arr_dims[1];
     }
     int *Carr = (int *) PyArray_DATA(arr);
 
     /* handle keys (a list of tuple) */
     seq = PySequence_Fast(arg2, "argument must be iterable");
     if (!seq) return NULL;
-    if (PySequence_Fast_GET_SIZE(seq) != arr1_dims[0]) {
+    if (PySequence_Fast_GET_SIZE(seq) != arr_dims[0]) {
         PyErr_SetString(PyExc_TypeError, "dims do not match between walks and keys.");
         return NULL;
     }
@@ -346,12 +342,12 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
     }
 
     /* initialize the hashtable */
-    items = NULL;
+    dict_item *items = NULL;
     int idx = 1;
     src = PySequence_Fast_ITEMS(seq);
 
     /* build two level hash table: 1) reindex main keys 2) hash unique node idx associated with each key */
-    for (int i = 0; i < arr1_dims[0]; i++) {
+    for (int i = 0; i < arr_dims[0]; i++) {
         /* make initial element */
         dict_item *k = malloc(sizeof(*k));
         // walk starts from each node (main key)
@@ -387,6 +383,8 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
                 idx++;
             }
         }
+        // must add, fix the memory leakage issue
+        Py_DECREF(item);
 //         printf("there are %u items\n", HASH_COUNT(k->sub));
     }
 
@@ -408,13 +406,13 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
     for (x = 0; x < iarr_dims[0]; x++) {
         int qid = 2 * x;
         int key1 = Ciarr[qid], key2 = Ciarr[qid + 1];
-        int id1 = find_key(key1), id2 = find_key(key2);
+        int id1 = find_key_item(items, key1), id2 = find_key_item(items, key2);
 //        printf("key1 %d, key2 %d id1 %d, id2 %d\n", key1, key2, id1, id2);
         for (int y = 0; y < 2 * stride; y += 2) {
-            Coarr[qid * stride + y] = find_idx(key1, Carr[id1 * stride + y / 2]);
-            Coarr[qid * stride + y + 1] = find_idx(key2, Carr[id1 * stride + y / 2]);
-            Coarr[odims[1] + qid * stride + y] = find_idx(key1, Carr[id2 * stride + y / 2]);
-            Coarr[odims[1] + qid * stride + y + 1] = find_idx(key2, Carr[id2 * stride + y / 2]);
+            Coarr[qid * stride + y] = find_idx(items, key1, Carr[id1 * stride + y / 2]);
+            Coarr[qid * stride + y + 1] = find_idx(items, key2, Carr[id1 * stride + y / 2]);
+            Coarr[odims[1] + qid * stride + y] = find_idx(items, key1, Carr[id2 * stride + y / 2]);
+            Coarr[odims[1] + qid * stride + y + 1] = find_idx(items, key2, Carr[id2 * stride + y / 2]);
         }
 //         for (y = 0; y < 2 * stride; y++) {
 //             if (y % 2 == 0) {
@@ -430,14 +428,14 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
     Py_DECREF(arr);
     Py_DECREF(iarr);
     Py_DECREF(seq);
-    delete_all();
+    delete_all(items);
     return PyArray_Return(oarr);
 
     fail:
     Py_XDECREF(arr);
-    Py_DECREF(iarr);
+    Py_XDECREF(iarr);
     Py_XDECREF(seq);
-    delete_all();
+    delete_all(items);
     PyArray_XDECREF_ERR(oarr);
     return NULL;
 }
