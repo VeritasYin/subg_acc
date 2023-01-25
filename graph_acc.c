@@ -341,7 +341,8 @@ static PyObject *np_sample(PyObject *self, PyObject *args, PyObject *kws) {
     Py_XDECREF(ptr);
     Py_XDECREF(neighs);
     Py_XDECREF(seq);
-    PyArray_XDECREF_ERR(oarr);
+    PyArray_DiscardWritebackIfCopy(oarr);
+    PyArray_XDECREF(oarr);
     return NULL;
 }
 
@@ -404,8 +405,10 @@ static PyObject *np_walk(PyObject *self, PyObject *args, PyObject *kws) {
     Py_XDECREF(ptr);
     Py_XDECREF(neighs);
     Py_XDECREF(seq);
-    PyArray_XDECREF_ERR(oarr);
-    PyArray_XDECREF_ERR(obj_arr);
+    PyArray_DiscardWritebackIfCopy(oarr);
+    PyArray_XDECREF(oarr);
+    PyArray_DiscardWritebackIfCopy(obj_arr);
+    PyArray_XDECREF(obj_arr);
     return NULL;
 }
 
@@ -542,8 +545,10 @@ static PyObject *np_join(PyObject *self, PyObject *args, PyObject *kws) {
     Py_XDECREF(iarr);
     Py_XDECREF(seq);
     delete_all(items);
-    PyArray_XDECREF_ERR(oarr);
-    PyArray_XDECREF_ERR(xarr);
+    PyArray_DiscardWritebackIfCopy(oarr);
+    PyArray_XDECREF(oarr);
+    PyArray_DiscardWritebackIfCopy(xarr);
+    PyArray_XDECREF(xarr);
     return NULL;
 }
 
