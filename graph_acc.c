@@ -1,6 +1,9 @@
 #define PY_SSIZE_T_CLEAN
-/* gcc/8.3.0, OPENMP 201511 */
-#include "utils.h"
+
+#include <Python.h>
+#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+#include <numpy/arrayobject.h>
+#include <omp.h>
 #include "uthash.h"
 
 #define DEBUG 0
@@ -15,6 +18,17 @@ static int find_key_int(dict_int *maps, int key) {
     dict_int *s;
     HASH_FIND_INT(maps, &key, s);  /* s: output pointer */
     return s ? s->val : -1;
+}
+
+void add_item(dict_int **maps, int key) {
+    dict_int *s;
+    HASH_FIND_INT(*maps, &key, s);  /* s: output pointer */
+    if (s == NULL) {
+        dict_int *k = malloc(sizeof(*k));
+        // walk starts from each node (main key)
+        k->key = key;
+        HASH_ADD_INT(*maps, key, k);
+    }
 }
 
 /* hash of hashes */
@@ -56,6 +70,7 @@ void delete_all(dict_item *maps) {
     }
 }
 
+// test func
 static PyObject *adds(PyObject *self, PyObject *args) {
     int arg1, arg2;
     if (!(PyArg_ParseTuple(args, "ii", &arg1, &arg2))) {
@@ -118,6 +133,7 @@ random_walk(int const *ptr, int const *neighs, int const *seq, int n, int num_wa
     }
 }
 
+// random walk without replacement (1st neigh)
 static void
 random_walk_wo(int const *ptr, int const *neighs, int const *seq, int n, int num_walks, int num_steps, int seed,
                int nthread, int *walks) {
@@ -175,7 +191,7 @@ random_walk_wo(int const *ptr, int const *neighs, int const *seq, int n, int num
 }
 
 
-void dis_encoding(int const *arr, int idx, int num_walks, int num_steps, PyArrayObject **out) {
+void rpe_encoder(int const *arr, int idx, int num_walks, int num_steps, PyArrayObject **out) {
     PyArrayObject *oarr1 = NULL, *oarr2 = NULL;
     dict_int *mapping = NULL;
     int offset = idx * num_walks * (num_steps + 1);
@@ -202,7 +218,6 @@ void dis_encoding(int const *arr, int idx, int num_walks, int num_steps, PyArray
         }
     }
     int num_keys = HASH_COUNT(mapping);
-//     printf("There are %u many unique keys.\n", num_keys);
 
     // create a new array
     npy_intp odims1[2] = {num_keys, num_steps + 1};
@@ -234,6 +249,102 @@ void dis_encoding(int const *arr, int idx, int num_walks, int num_steps, PyArray
     out[2 * idx] = oarr2, out[2 * idx + 1] = oarr1;
 }
 
+static PyObject *np_sample(PyObject *self, PyObject *args, PyObject *kws) {
+    PyObject *arg1 = NULL, *arg2 = NULL, *query = NULL;
+    PyArrayObject *ptr = NULL, *neighs = NULL, *seq = NULL, *oarr = NULL;
+    int num_walks = 200, num_steps = 8, seed = 111413, nthread = -1, thld = 1000;
+
+    static char *kwlist[] = {"ptr", "neighs", "query", "num_walks", "num_steps", "thld", "nthread", "seed", NULL};
+    if (!(PyArg_ParseTupleAndKeywords(args, kws, "OOO|iiiiip", kwlist, &arg1, &arg2, &query, &num_walks, &num_steps,
+                                      &thld, &nthread, &seed))) {
+        PyErr_SetString(PyExc_TypeError, "input parsing error.");
+        return NULL;
+    }
+
+    /* handle walks (numpy array) */
+    ptr = (PyArrayObject *) PyArray_FROM_OTF(arg1, NPY_INT, NPY_ARRAY_IN_ARRAY);
+    if (!ptr) return NULL;
+    int *Cptr = PyArray_DATA(ptr);
+
+    neighs = (PyArrayObject *) PyArray_FROM_OTF(arg2, NPY_INT, NPY_ARRAY_IN_ARRAY);
+    if (!neighs) return NULL;
+    int *Cneighs = PyArray_DATA(neighs);
+
+    seq = (PyArrayObject *) PyArray_FROM_OTF(query, NPY_INT, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST);
+    if (!seq) return NULL;
+    int *Cseq = PyArray_DATA(seq);
+
+    int n = (int) PyArray_SIZE(seq);
+
+    unsigned int private_seed = (unsigned int) (seed + getpid());
+    /* initialize the hashtable */
+    dict_int *sets = NULL;
+    for (int i = 0; i < n; i++) {
+        int num_hop1 = Cptr[Cseq[i] + 1] - Cptr[Cseq[i]];
+        int num_neighs, rseq[num_hop1];
+        if (num_hop1 > num_walks) {
+            int s, t;
+            for (int j = 0; j < num_hop1; j++)
+                rseq[j] = j;
+            for (int k = 0; k < num_walks; k++) {
+                s = rand_r(&private_seed) % (num_hop1 - k) + k;
+                t = rseq[k];
+                rseq[k] = rseq[s];
+                rseq[s] = t;
+            }
+        }
+        add_item(&sets, Cseq[i]);
+
+        for (int walk = 0; walk < num_walks; walk++) {
+            int curr = Cseq[i];
+            if (num_hop1 < 1) {
+                break;
+            } else if (num_hop1 <= num_walks) {
+                curr = Cneighs[Cptr[curr] + walk % num_hop1];
+            } else {
+                curr = Cneighs[Cptr[curr] + rseq[walk]];
+            }
+            for (int step = 1; step < num_steps; step++) {
+                add_item(&sets, curr);
+                num_neighs = Cptr[curr + 1] - Cptr[curr];
+                if (num_neighs > 0) {
+                    curr = Cneighs[Cptr[curr] + (rand_r(&private_seed) % num_neighs)];
+                    add_item(&sets, curr);
+                }
+            }
+            if ((int) HASH_COUNT(sets) >= ((i + 1) * thld / n))
+                break;
+        }
+    }
+
+    npy_intp odims[1] = {HASH_COUNT(sets)};
+    oarr = (PyArrayObject *) PyArray_SimpleNew(1, odims, NPY_INT);
+    if (oarr == NULL) goto fail;
+    int *Coarr = (int *) PyArray_DATA(oarr);
+
+    // free memory
+    dict_int *cur_item, *tmp;
+    int idx = 0;
+    HASH_ITER(hh, sets, cur_item, tmp) {
+        Coarr[idx] = cur_item->key;
+        HASH_DEL(sets, cur_item);  /* delete it (users advances to next) */
+        free(cur_item);               /* free it */
+        idx++;
+    }
+
+    Py_DECREF(ptr);
+    Py_DECREF(neighs);
+    Py_DECREF(seq);
+    return PyArray_Return(oarr);
+
+    fail:
+    Py_XDECREF(ptr);
+    Py_XDECREF(neighs);
+    Py_XDECREF(seq);
+    PyArray_XDECREF_ERR(oarr);
+    return NULL;
+}
+
 static PyObject *np_walk(PyObject *self, PyObject *args, PyObject *kws) {
     PyObject *arg1 = NULL, *arg2 = NULL, *query = NULL;
     PyArrayObject *ptr = NULL, *neighs = NULL, *seq = NULL, *oarr = NULL, *obj_arr = NULL;
@@ -261,13 +372,11 @@ static PyObject *np_walk(PyObject *self, PyObject *args, PyObject *kws) {
     int *Cseq = PyArray_DATA(seq);
 
     n = (int) PyArray_SIZE(seq);
-//     printf("size of input %d\n", n);
 
     npy_intp odims[2] = {n, num_walks * (num_steps + 1)};
     oarr = (PyArrayObject *) PyArray_SimpleNew(2, odims, NPY_INT);
     if (oarr == NULL) goto fail;
     int *Coarr = (int *) PyArray_DATA(oarr);
-//     printf("Dims of output: %d, %d \n", (int) odims[0], (int) odims[1]);
 
     npy_intp obj_dims[2] = {n, 2};
     obj_arr = (PyArrayObject *) PyArray_SimpleNew(2, obj_dims, NPY_OBJECT);
@@ -283,7 +392,7 @@ static PyObject *np_walk(PyObject *self, PyObject *args, PyObject *kws) {
 
 #pragma omp for
     for (int k = 0; k < n; k++) {
-        dis_encoding(Coarr, k, num_walks, num_steps, Cobj_arr);
+        rpe_encoder(Coarr, k, num_walks, num_steps, Cobj_arr);
     }
 
     Py_DECREF(ptr);
@@ -300,13 +409,13 @@ static PyObject *np_walk(PyObject *self, PyObject *args, PyObject *kws) {
     return NULL;
 }
 
-static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
+static PyObject *np_join(PyObject *self, PyObject *args, PyObject *kws) {
     PyObject *arg1 = NULL, *arg2 = NULL, *query = NULL, *seq = NULL, **src;
-    PyArrayObject *arr = NULL, *iarr = NULL, *oarr = NULL;
-    int nthread = -1;
+    PyArrayObject *arr = NULL, *iarr = NULL, *oarr = NULL, *xarr = NULL;
+    int nthread = -1, re = -1;
 
-    static char *kwlist[] = {"walk", "key", "query", "nthread", NULL};
-    if (!(PyArg_ParseTupleAndKeywords(args, kws, "OOO|i", kwlist, &arg1, &arg2, &query, &nthread))) {
+    static char *kwlist[] = {"walk", "key", "query", "nthread", "return_idx", NULL};
+    if (!(PyArg_ParseTupleAndKeywords(args, kws, "OOO|ip", kwlist, &arg1, &arg2, &query, &nthread, &re))) {
         PyErr_SetString(PyExc_TypeError, "input parsing error.");
         return NULL;
     }
@@ -331,7 +440,7 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
         return NULL;
     }
 
-    /* handle queries (numpy array) */
+    /* handle queries (numpy array/sequence) */
     iarr = (PyArrayObject *) PyArray_FROM_OTF(query, NPY_INT, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST);
     if (!iarr) return NULL;
     npy_intp *iarr_dims = PyArray_DIMS(iarr);
@@ -376,16 +485,15 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
             for (int j = 0; j < item_size; j++) {
                 /* add a sub hash table off this element */
                 dict_item *w = malloc(sizeof(*w));
-                w->key = (*(int *) PyArray_GETPTR1((PyArrayObject *)item, j));
+                w->key = (*(int *) PyArray_GETPTR1((PyArrayObject *) item, j));
                 w->sub = NULL;
                 w->val = idx;
                 HASH_ADD_INT(k->sub, key, w);
                 idx++;
             }
         }
-        // must add, fix the memory leakage issue
+        // must add, to avoid memory leakage
         Py_DECREF(item);
-//         printf("there are %u items\n", HASH_COUNT(k->sub));
     }
 
     /* allocate a new return numpy array */
@@ -398,38 +506,36 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
         printf("Dims of output: %d, %d\n", (int) odims[0], (int) odims[1]);
     }
 
+    xarr = (PyArrayObject *) PyArray_SimpleNew(2, iarr_dims, NPY_INT);
+    if (xarr == NULL) goto fail;
+    int *Cxarr = (int *) PyArray_DATA(xarr);
+
     if (nthread > 0) {
         omp_set_num_threads(nthread);
     }
-    int x;
-#pragma omp parallel for private(x)
-    for (x = 0; x < iarr_dims[0]; x++) {
+
+#pragma omp parallel for
+    for (int x = 0; x < iarr_dims[0]; x++) {
         int qid = 2 * x;
         int key1 = Ciarr[qid], key2 = Ciarr[qid + 1];
-        int id1 = find_key_item(items, key1), id2 = find_key_item(items, key2);
-//        printf("key1 %d, key2 %d id1 %d, id2 %d\n", key1, key2, id1, id2);
+        Cxarr[qid] = find_key_item(items, key1), Cxarr[qid+1] = find_key_item(items, key2);
         for (int y = 0; y < 2 * stride; y += 2) {
-            Coarr[qid * stride + y] = find_idx(items, key1, Carr[id1 * stride + y / 2]);
-            Coarr[qid * stride + y + 1] = find_idx(items, key2, Carr[id1 * stride + y / 2]);
-            Coarr[odims[1] + qid * stride + y] = find_idx(items, key1, Carr[id2 * stride + y / 2]);
-            Coarr[odims[1] + qid * stride + y + 1] = find_idx(items, key2, Carr[id2 * stride + y / 2]);
+            Coarr[qid * stride + y] = find_idx(items, key1, Carr[Cxarr[qid] * stride + y / 2]);
+            Coarr[qid * stride + y + 1] = find_idx(items, key2, Carr[Cxarr[qid] * stride + y / 2]);
+            Coarr[odims[1] + qid * stride + y] = find_idx(items, key1, Carr[Cxarr[qid+1] * stride + y / 2]);
+            Coarr[odims[1] + qid * stride + y + 1] = find_idx(items, key2, Carr[Cxarr[qid+1] * stride + y / 2]);
         }
-//         for (y = 0; y < 2 * stride; y++) {
-//             if (y % 2 == 0) {
-//                 Coarr[qid * stride + y] = find_idx(key1, Carr1[id1 * stride + y / 2]);
-//                 Coarr[odims[1] + qid * stride + y] = find_idx(key1, Carr1[id2 * stride + y / 2]);
-//             } else {
-//                 Coarr[qid * stride + y] = find_idx(key2, Carr1[id1 * stride + y / 2]);
-//                 Coarr[odims[1] + qid * stride + y] = find_idx(key2, Carr1[id2 * stride + y / 2]);
-//             }
-//         }
     }
 
     Py_DECREF(arr);
     Py_DECREF(iarr);
     Py_DECREF(seq);
     delete_all(items);
-    return PyArray_Return(oarr);
+    if (re>0){
+        return Py_BuildValue("[N,N]", PyArray_Return(oarr), PyArray_Return(xarr));
+    }else{
+        return PyArray_Return(oarr);
+    }
 
     fail:
     Py_XDECREF(arr);
@@ -437,31 +543,34 @@ static PyObject *np_gather(PyObject *self, PyObject *args, PyObject *kws) {
     Py_XDECREF(seq);
     delete_all(items);
     PyArray_XDECREF_ERR(oarr);
+    PyArray_XDECREF_ERR(xarr);
     return NULL;
 }
 
-static PyMethodDef GComMethods[] = {
-        {"add",      adds,                    METH_VARARGS, "Add ops."},
-        {"run",      exe,                     METH_VARARGS, "Execute a shell command."},
-        {"gather",   (PyCFunction) np_gather, METH_VARARGS | METH_KEYWORDS,
-                        "Gather op with a list of pairs (numpy, openmp)."},
-        {"ran_walk", (PyCFunction) np_walk,   METH_VARARGS | METH_KEYWORDS,
-                        "Random walks with distance encoding (numpy, openmp)."},
+static PyMethodDef GAccMethods[] = {
+        {"add",        adds,                    METH_VARARGS, "Add ops."},
+        {"run",        exe,                     METH_VARARGS, "Execute a shell command."},
+        {"sjoin",     (PyCFunction) np_join, METH_VARARGS | METH_KEYWORDS,
+                                                              "RPE (subgraph) join op with a list of pairs (numpy, openmp)."},
+        {"run_walk",   (PyCFunction) np_walk,   METH_VARARGS | METH_KEYWORDS,
+                                                              "Random walks with RPE encoding (numpy, openmp)."},
+        {"run_sample", (PyCFunction) np_sample, METH_VARARGS | METH_KEYWORDS,
+                                                              "Random sampling (numpy, openmp)."},
         {NULL, NULL, 0, NULL}
 };
 
-static char gcom_doc[] = "C extension for gather operation.";
+static char gacc_doc[] = "C extension for SUREL framework.";
 
-static struct PyModuleDef gcommodule = {
+static struct PyModuleDef gaccmodule = {
         PyModuleDef_HEAD_INIT,
-        "gcom_acc",   /* name of module */
-        gcom_doc, /* module documentation, may be NULL */
+        "surel_gacc",   /* name of module */
+        gacc_doc, /* module documentation, may be NULL */
         -1,       /* size of per-interpreter state of the module,
                  or -1 if the module keeps state in global variables. */
-        GComMethods
+        GAccMethods
 };
 
-PyMODINIT_FUNC PyInit_gcom_acc(void) {
+PyMODINIT_FUNC PyInit_surel_gacc(void) {
     import_array();
-    return PyModule_Create(&gcommodule);
+    return PyModule_Create(&gaccmodule);
 }
