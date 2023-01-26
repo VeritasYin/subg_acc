@@ -8,6 +8,6 @@ module1 = Extension('surel_gacc',
                     include_dirs=[numpy.get_include()])
 
 setup (name = 'SUREL_GAcc',
-       version = '1.0',
+       version = '1.1',
        description = 'This is a package for accelerated graph operations in SUREL framework.',
        ext_modules = [module1])
