@@ -803,7 +803,7 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
             {
                 maxset = nsize[j];
             }
-            if (ncumsum[j + 1] * ncol > enc_size)
+            while (ncumsum[j + 1] * ncol > enc_size)
             {
                 enc_size *= 1.5;
                 encoding = realloc(encoding, enc_size * sizeof(int));
