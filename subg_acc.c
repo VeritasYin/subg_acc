@@ -678,7 +678,6 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     int n = (int)PyArray_SIZE(seq);
     int ncol = num_steps + 1;
     int stride = (bucket < 0) ? num_walks * num_steps + 1 : bucket;
-    // printf("n %d, stride %d, bucket %d\n", n, stride, bucket);
 
     // create an array for compressed encoding / buffer
     int buffer_size = min(n, NMAX) * stride;
@@ -695,7 +694,6 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     short *encoding;
     long enc_size = (long)n * num_walks * ncol;
     encoding = (short *)PyMem_RawMalloc(enc_size * sizeof(short));
-    // printf("Size of int %ld, short %ld, total %ld\n", sizeof(int), sizeof(short), enc_size);
     if (encoding == NULL)
     {
         PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for encoding.\n");
@@ -738,9 +736,6 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     int maxset = 0, blk = 1, nblk = 2 + ((n - 1) / NMAX);
     while (blk < nblk)
     {
-        // Start measuring time
-        // struct timeval tic, tac;
-        // gettimeofday(&tic, 0);
         memset(buffer, 0, buffer_size * ncol * sizeof(*buffer));
         // max node id 2,147,483,647
         int begin = (blk - 1) * NMAX, end = min(blk * NMAX, n);
@@ -755,7 +750,6 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
                 int num_hop1 = min(Cptr[Cseq[i] + 1] - Cptr[Cseq[i]], NEBMAX);
                 buffer[offset] = num_walks;
 
-                // if ((num_hop1 == 0) | ((num_hop1==1) & (Cseq[i] == Cneighs[Cptr[Cseq[i]]])))
                 if (num_hop1 == 0)
                 {
                     nsize[i] = 1;
@@ -876,10 +870,6 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
             memcpy(encoding + ncumsum[j] * ncol, buffer + (j % NMAX) * stride * ncol, nsize[j] * ncol * sizeof(*buffer));
             memmove(nidx + ncumsum[j], nidx + (long)j * stride, nsize[j] * sizeof(*nidx));
         }
-        // Stop measuring time and calculate the elapsed time
-        // gettimeofday(&tac, 0);
-        // double elapsed = (long)(tac.tv_sec - tic.tv_sec) + (tac.tv_usec - tic.tv_usec) * 1e-6;
-        // printf("run blk %d ptr %ld dt %.2fs\n", blk, ncumsum[begin], elapsed);
         blk += 1;
     }
     gettimeofday(&wtac, 0);
@@ -971,7 +961,6 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     {
         curr = bithash[i];
         idx = find_key_long(unique, curr);
-        // printf("idx %ld, val %d, #unique %d, curr %ld, total %ld\n", i, idx, count, curr, ntotal);
         if (idx < 0)
         {
             dict_long *kh = malloc(sizeof(*kh));
@@ -985,7 +974,6 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
             }
             count++;
         }
-        // printf("access %ld, %ld\n", ntotal, i);
         nidx[ntotal + i] = idx;
     }
     PyMem_RawFree(ncumsum);
