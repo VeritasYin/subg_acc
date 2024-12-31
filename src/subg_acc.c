@@ -3,14 +3,16 @@
 #include <Python.h>
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <numpy/arrayobject.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include "uthash.h"
 #include <sys/time.h>
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 
 #define DEBUG 0
 #define NMAX 65536
-#define NEBMAX 1e6
+#define NEBMAX 2e6
 
 #define HASH_FIND_LONG(head, findlong, out) \
     HASH_FIND(hh, head, findlong, sizeof(long), out)
@@ -30,6 +32,14 @@ typedef struct item_long
     int val;
     UT_hash_handle hh;
 } dict_long;
+
+typedef struct item_enc
+{
+    long key;
+    int val;
+    int16_t enc[8];
+    UT_hash_handle hh;
+} dict_enc;
 
 /* hash of hashes */
 typedef struct item
@@ -62,6 +72,13 @@ static int find_key_int(dict_int *maps, int key)
 static int find_key_long(dict_long *maps, long key)
 {
     dict_long *s;
+    HASH_FIND_LONG(maps, &key, s); /* s: output pointer */
+    return s ? s->val : -1;
+}
+
+static int find_key_enc(dict_enc *maps, long key)
+{
+    dict_enc *s;
     HASH_FIND_LONG(maps, &key, s); /* s: output pointer */
     return s ? s->val : -1;
 }
@@ -141,6 +158,125 @@ static void f_format(const npy_intp *dims, int *CArrays)
     }
 }
 
+static PyObject *batch_sampler(PyObject *self, PyObject *args, PyObject *kws)
+{
+    PyObject *arg1 = NULL, *arg2 = NULL, *query = NULL;
+    PyArrayObject *ptr = NULL, *neighs = NULL, *seq = NULL, *oarr = NULL;
+    int num_walks = 200, num_steps = 8, seed = 111413, nthread = -1, thld = 1000;
+
+    static char *kwlist[] = {"ptr", "neighs", "query", "num_walks", "num_steps", "thld", "nthread", "seed", NULL};
+    if (!(PyArg_ParseTupleAndKeywords(args, kws, "OOO|iiiii", kwlist, &arg1, &arg2, &query, &num_walks, &num_steps, &thld, &nthread, &seed)))
+    {
+        PyErr_SetString(PyExc_TypeError, "Input parsing error.\n");
+        return NULL;
+    }
+
+    /* handle the adjacency matrix of input graph in CSR format */
+    ptr = (PyArrayObject *)PyArray_FROM_OTF(arg1, NPY_INT, NPY_ARRAY_IN_ARRAY);
+    if (!ptr)
+        return NULL;
+    int *Cptr = PyArray_DATA(ptr);
+
+    neighs = (PyArrayObject *)PyArray_FROM_OTF(arg2, NPY_INT, NPY_ARRAY_IN_ARRAY);
+    if (!neighs)
+        return NULL;
+    int *Cneighs = PyArray_DATA(neighs);
+
+    seq = (PyArrayObject *)PyArray_FROM_OTF(query, NPY_INT, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST);
+    if (!seq)
+        return NULL;
+    int *Cseq = PyArray_DATA(seq);
+
+    int n = (int)PyArray_SIZE(seq);
+    
+    uint private_seed = (uint)(seed + getpid());
+
+    /* initialize the hashtable */
+    dict_int *batch = NULL;
+    for (int i = 0; i < n; i++)
+    {
+        int num_hop1 = Cptr[Cseq[i] + 1] - Cptr[Cseq[i]];
+        int num_neighs, rseq[num_hop1];
+
+        if (num_hop1 > num_walks)
+        {
+            int s, t;
+            for (int j = 0; j < num_hop1; j++)
+                rseq[j] = j;
+            for (int k = 0; k < num_walks; k++)
+            {
+                s = rand_r(&private_seed) % (num_hop1 - k) + k;
+                t = rseq[k];
+                rseq[k] = rseq[s];
+                rseq[s] = t;
+            }
+        }
+
+        add_item(&batch, Cseq[i]);
+
+        for (int walk = 0; walk < num_walks; walk++)
+        {
+            int curr = Cseq[i];
+            if (num_hop1 < 1)
+            {
+                break;
+            }
+            else if (num_hop1 <= num_walks)
+            {
+                curr = Cneighs[Cptr[curr] + walk % num_hop1];
+            }
+            else
+            {
+                curr = Cneighs[Cptr[curr] + rseq[walk]];
+            }
+            add_item(&batch, curr);
+
+            for (int step = 1; step < num_steps; step++)
+            {
+                num_neighs = Cptr[curr + 1] - Cptr[curr];
+                if (num_neighs > 0)
+                {
+                    curr = Cneighs[Cptr[curr] + (rand_r(&private_seed) % num_neighs)];
+                    add_item(&batch, curr);
+                }
+            }
+
+            if ((int)HASH_COUNT(batch) >= ((i + 1) * thld / n))
+                break;
+        }
+    }
+
+    // create an array for sampled batch
+    npy_intp odims[1] = {HASH_COUNT(batch)};
+    oarr = (PyArrayObject *)PyArray_SimpleNew(1, odims, NPY_INT);
+    if (oarr == NULL)
+        goto fail;
+    int *Coarr = (int *)PyArray_DATA(oarr);
+
+    // free memory
+    dict_int *cur_item, *tmp;
+    int idx = 0;
+    HASH_ITER(hh, batch, cur_item, tmp)
+    {
+        Coarr[idx] = cur_item->key;
+        HASH_DEL(batch, cur_item); /* delete it (users advances to next) */
+        free(cur_item);            /* free it */
+        idx++;
+    }
+
+    Py_DECREF(ptr);
+    Py_DECREF(neighs);
+    Py_DECREF(seq);
+    return PyArray_Return(oarr);
+
+fail:
+    Py_XDECREF(ptr);
+    Py_XDECREF(neighs);
+    Py_XDECREF(seq);
+    PyArray_XDECREF(oarr);
+    return NULL;
+}
+
 static void random_walk(int const *ptr, int const *neighs, int const *seq, int n, int num_walks, int num_steps, int seed, int nthread, int *walks)
 {
     /* https://github.com/lkskstlr/rwalk */
@@ -148,6 +284,7 @@ static void random_walk(int const *ptr, int const *neighs, int const *seq, int n
     {
         printf("[Input] n: %d, num_walks: %d, num_steps: %d, seed: %d, nthread: %d\n", n, num_walks, num_steps, seed, nthread);
     }
+#ifdef _OPENMP
     if (nthread > 0)
     {
         omp_set_num_threads(nthread);
@@ -155,7 +292,7 @@ static void random_walk(int const *ptr, int const *neighs, int const *seq, int n
 #pragma omp parallel
     {
         int thread_num = omp_get_thread_num();
-        unsigned int private_seed = (unsigned int)(seed + thread_num);
+        uint private_seed = (uint)(seed + thread_num);
 #pragma omp for
         for (int i = 0; i < n; i++)
         {
@@ -177,11 +314,34 @@ static void random_walk(int const *ptr, int const *neighs, int const *seq, int n
             }
         }
     }
+#else
+    srand(seed);
+    for (int i = 0; i < n; i++)
+    {
+        int offset, num_neighs;
+        for (int walk = 0; walk < num_walks; walk++)
+        {
+            int curr = seq[i];
+            offset = i * num_walks * (num_steps + 1) + walk * (num_steps + 1);
+            walks[offset] = curr;
+            for (int step = 0; step < num_steps; step++)
+            {
+                num_neighs = ptr[curr + 1] - ptr[curr];
+                if (num_neighs > 0)
+                {
+                    curr = neighs[ptr[curr] + (rand() % num_neighs)];
+                }
+                walks[offset + step + 1] = curr;
+            }
+        }
+    }
+#endif
 }
 
 // random walk without replacement (1st neigh)
 static void random_walk_wo(int const *ptr, int const *neighs, int const *seq, int n, int num_walks, int num_steps, int seed, int nthread, int *walks)
 {
+#ifdef _OPENMP
     if (nthread > 0)
     {
         omp_set_num_threads(nthread);
@@ -189,7 +349,7 @@ static void random_walk_wo(int const *ptr, int const *neighs, int const *seq, in
 #pragma omp parallel
     {
         int thread_num = omp_get_thread_num();
-        unsigned int private_seed = (unsigned int)(seed + thread_num);
+        uint private_seed = (uint)(seed + thread_num);
 
 #pragma omp for
         for (int i = 0; i < n; i++)
@@ -244,6 +404,59 @@ static void random_walk_wo(int const *ptr, int const *neighs, int const *seq, in
             }
         }
     }
+#else
+    srand(seed);
+    for (int i = 0; i < n; i++)
+    {
+        int offset, num_neighs;
+
+        int num_hop1 = ptr[seq[i] + 1] - ptr[seq[i]];
+        int rseq[num_hop1];
+        if (num_hop1 > num_walks)
+        {
+            int s, t;
+            for (int j = 0; j < num_hop1; j++)
+                rseq[j] = j;
+            for (int k = 0; k < num_walks; k++)
+            {
+                s = rand() % (num_hop1 - k) + k;
+                t = rseq[k];
+                rseq[k] = rseq[s];
+                rseq[s] = t;
+            }
+        }
+
+        for (int walk = 0; walk < num_walks; walk++)
+        {
+            int curr = seq[i];
+            offset = i * num_walks * (num_steps + 1) + walk * (num_steps + 1);
+            walks[offset] = curr;
+            if (num_hop1 < 1)
+            {
+                walks[offset + 1] = curr;
+            }
+            else if (num_hop1 <= num_walks)
+            {
+                curr = neighs[ptr[curr] + walk % num_hop1];
+                walks[offset + 1] = curr;
+            }
+            else
+            {
+                curr = neighs[ptr[curr] + rseq[walk]];
+                walks[offset + 1] = curr;
+            }
+            for (int step = 1; step < num_steps; step++)
+            {
+                num_neighs = ptr[curr + 1] - ptr[curr];
+                if (num_neighs > 0)
+                {
+                    curr = neighs[ptr[curr] + (rand() % num_neighs)];
+                }
+                walks[offset + step + 1] = curr;
+            }
+        }
+    }
+#endif
 }
 
 void rpe_encoder(int const *arr, int idx, int num_walks, int num_steps, PyArrayObject **out)
@@ -367,12 +580,19 @@ static PyObject *walk_sampler(PyObject *self, PyObject *args, PyObject *kws)
     if (obj_arr == NULL)
         goto fail;
     PyArrayObject **Cobj_arr = PyArray_DATA(obj_arr);
-
+    
+#ifdef _OPENMP
 #pragma omp for
     for (int k = 0; k < n; k++)
     {
         rpe_encoder(Coarr, k, num_walks, num_steps, Cobj_arr);
     }
+#else
+    for (int k = 0; k < n; k++)
+    {
+        rpe_encoder(Coarr, k, num_walks, num_steps, Cobj_arr);
+    }
+#endif
 
     Py_DECREF(ptr);
     Py_DECREF(neighs);
@@ -385,124 +605,6 @@ fail:
     Py_XDECREF(seq);
     PyArray_XDECREF(oarr);
     PyArray_XDECREF(obj_arr);
-    return NULL;
-}
-
-static PyObject *batch_sampler(PyObject *self, PyObject *args, PyObject *kws)
-{
-    PyObject *arg1 = NULL, *arg2 = NULL, *query = NULL;
-    PyArrayObject *ptr = NULL, *neighs = NULL, *seq = NULL, *oarr = NULL;
-    int num_walks = 200, num_steps = 8, seed = 111413, nthread = -1, thld = 1000;
-
-    static char *kwlist[] = {"ptr", "neighs", "query", "num_walks", "num_steps", "thld", "nthread", "seed", NULL};
-    if (!(PyArg_ParseTupleAndKeywords(args, kws, "OOO|iiiii", kwlist, &arg1, &arg2, &query, &num_walks, &num_steps, &thld, &nthread, &seed)))
-    {
-        PyErr_SetString(PyExc_TypeError, "Input parsing error.\n");
-        return NULL;
-    }
-
-    /* handle the adjacency matrix of input graph in CSR format */
-    ptr = (PyArrayObject *)PyArray_FROM_OTF(arg1, NPY_INT, NPY_ARRAY_IN_ARRAY);
-    if (!ptr)
-        return NULL;
-    int *Cptr = PyArray_DATA(ptr);
-
-    neighs = (PyArrayObject *)PyArray_FROM_OTF(arg2, NPY_INT, NPY_ARRAY_IN_ARRAY);
-    if (!neighs)
-        return NULL;
-    int *Cneighs = PyArray_DATA(neighs);
-
-    seq = (PyArrayObject *)PyArray_FROM_OTF(query, NPY_INT, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST);
-    if (!seq)
-        return NULL;
-    int *Cseq = PyArray_DATA(seq);
-
-    int n = (int)PyArray_SIZE(seq);
-    unsigned int private_seed = (unsigned int)(seed + getpid());
-
-    /* initialize the hashtable */
-    dict_int *batch = NULL;
-    for (int i = 0; i < n; i++)
-    {
-        int num_hop1 = Cptr[Cseq[i] + 1] - Cptr[Cseq[i]];
-        int num_neighs, rseq[num_hop1];
-
-        if (num_hop1 > num_walks)
-        {
-            int s, t;
-            for (int j = 0; j < num_hop1; j++)
-                rseq[j] = j;
-            for (int k = 0; k < num_walks; k++)
-            {
-                s = rand_r(&private_seed) % (num_hop1 - k) + k;
-                t = rseq[k];
-                rseq[k] = rseq[s];
-                rseq[s] = t;
-            }
-        }
-
-        add_item(&batch, Cseq[i]);
-
-        for (int walk = 0; walk < num_walks; walk++)
-        {
-            int curr = Cseq[i];
-            if (num_hop1 < 1)
-            {
-                break;
-            }
-            else if (num_hop1 <= num_walks)
-            {
-                curr = Cneighs[Cptr[curr] + walk % num_hop1];
-            }
-            else
-            {
-                curr = Cneighs[Cptr[curr] + rseq[walk]];
-            }
-            add_item(&batch, curr);
-
-            for (int step = 1; step < num_steps; step++)
-            {
-                num_neighs = Cptr[curr + 1] - Cptr[curr];
-                if (num_neighs > 0)
-                {
-                    curr = Cneighs[Cptr[curr] + (rand_r(&private_seed) % num_neighs)];
-                    add_item(&batch, curr);
-                }
-            }
-
-            if ((int)HASH_COUNT(batch) >= ((i + 1) * thld / n))
-                break;
-        }
-    }
-
-    // create an array for sampled batch
-    npy_intp odims[1] = {HASH_COUNT(batch)};
-    oarr = (PyArrayObject *)PyArray_SimpleNew(1, odims, NPY_INT);
-    if (oarr == NULL)
-        goto fail;
-    int *Coarr = (int *)PyArray_DATA(oarr);
-
-    // free memory
-    dict_int *cur_item, *tmp;
-    int idx = 0;
-    HASH_ITER(hh, batch, cur_item, tmp)
-    {
-        Coarr[idx] = cur_item->key;
-        HASH_DEL(batch, cur_item); /* delete it (users advances to next) */
-        free(cur_item);            /* free it */
-        idx++;
-    }
-
-    Py_DECREF(ptr);
-    Py_DECREF(neighs);
-    Py_DECREF(seq);
-    return PyArray_Return(oarr);
-
-fail:
-    Py_XDECREF(ptr);
-    Py_XDECREF(neighs);
-    Py_XDECREF(seq);
-    PyArray_XDECREF(oarr);
     return NULL;
 }
 
@@ -602,11 +704,11 @@ static PyObject *walk_join(PyObject *self, PyObject *args, PyObject *kws)
         goto fail;
     int *Cxarr = (int *)PyArray_DATA(xarr);
 
+#ifdef _OPENMP
     if (nthread > 0)
     {
         omp_set_num_threads(nthread);
     }
-
 #pragma omp parallel for
     for (int x = 0; x < qarr_dims[0]; x++)
     {
@@ -622,6 +724,22 @@ static PyObject *walk_join(PyObject *self, PyObject *args, PyObject *kws)
             Coarr[odims[1] + qid * stride + y + 1] = find_idx(items, key2, Cwarr[offset2]);
         }
     }
+#else
+    for (int x = 0; x < qarr_dims[0]; x++)
+    {
+        int qid = 2 * x;
+        int key1 = Cqarr[qid], key2 = Cqarr[qid + 1];
+        Cxarr[qid] = find_key_item(items, key1), Cxarr[qid + 1] = find_key_item(items, key2);
+        for (int y = 0; y < 2 * stride; y += 2)
+        {
+            int offset1 = Cxarr[qid] * stride + y / 2, offset2 = Cxarr[qid + 1] * stride + y / 2;
+            Coarr[qid * stride + y] = find_idx(items, key1, Cwarr[offset1]);
+            Coarr[qid * stride + y + 1] = find_idx(items, key2, Cwarr[offset1]);
+            Coarr[odims[1] + qid * stride + y] = find_idx(items, key1, Cwarr[offset2]);
+            Coarr[odims[1] + qid * stride + y + 1] = find_idx(items, key2, Cwarr[offset2]);
+        }
+    }
+#endif
 
     Py_DECREF(warr);
     Py_DECREF(qarr);
@@ -646,7 +764,7 @@ fail:
     return NULL;
 }
 
-static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
+static PyObject *gset_sampler(PyObject *self, PyObject *args, PyObject *kws)
 {
     PyObject *arg1 = NULL, *arg2 = NULL, *query = NULL;
     PyArrayObject *ptr = NULL, *neighs = NULL, *seq = NULL, *oarr = NULL, *xarr = NULL, *narr = NULL, *earr = NULL;
@@ -678,6 +796,7 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     int n = (int)PyArray_SIZE(seq);
     int ncol = num_steps + 1;
     int stride = (bucket < 0) ? num_walks * num_steps + 1 : bucket;
+    // printf("n %d, stride %d, bucket %d\n", n, stride, bucket);
 
     // create an array for compressed encoding / buffer
     int buffer_size = min(n, NMAX) * stride;
@@ -688,20 +807,21 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
         PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for buffer.\n");
         goto fail;
     }
-    short *buffer = (short *)PyArray_DATA(xarr);
+    int16_t *buffer = (int16_t *)PyArray_DATA(xarr);
 
     // Dynamically allocate memory using malloc() for large n
-    short *encoding;
-    long enc_size = (long)n * num_walks * ncol;
-    encoding = (short *)PyMem_RawMalloc(enc_size * sizeof(short));
+    int16_t *encoding;
+    int64_t enc_size = (int64_t)n * num_walks * ncol;
+    encoding = (int16_t *)PyMem_RawMalloc(enc_size * sizeof(int16_t));
+    // printf("Size of int %ld, int16_t %ld, total %ld\n", sizeof(int), sizeof(int16_t), enc_size);
     if (encoding == NULL)
     {
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for encoding.\n");
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for enc array.\n");
         return NULL;
     }
 
     // create an array for storing remapped index of encoding
-    npy_intp odims[1] = {(long)n * stride};
+    npy_intp odims[1] = {(int64_t)n * stride};
     oarr = (PyArrayObject *)PyArray_EMPTY(1, odims, NPY_INT, 0);
     int *nidx = (int *)PyArray_DATA(oarr);
     if (oarr == NULL)
@@ -720,25 +840,46 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     }
     int *nsize = (int *)PyArray_DATA(narr);
 
-    long *ncumsum;
-    ncumsum = (long *)PyMem_RawMalloc((n + 1) * sizeof(long));
+    // create an array for storing cumulative sum of set size
+    int64_t *ncumsum;
+    ncumsum = (int64_t *)PyMem_RawMalloc((n + 1) * sizeof(int64_t));
     ncumsum[0] = 0;
 
-    if (nthread > 0)
+    uint32_t LEAD;
+    // __builtin_clz returns the number of leading 0-bits in x, starting at the most significant bit position.
+    // If x is 0, the result is undefined
+    const int SHIFT = 32 - __builtin_clz(num_walks);
+    LEAD = (ncol - 1) * SHIFT;
+    if (sizeof(uint32_t) * 8 >= 1 + LEAD)
     {
-        omp_set_num_threads(nthread);
+        printf("#SubGAcc: SHIFT %d, LEAD %ld, w_enc %ld, w_hash %ld ", SHIFT, LEAD, sizeof(*encoding) * 8, sizeof(uint32_t) * 8);
+        LEAD = (uint32_t)1 << LEAD;
+        printf("LEAD mask 0x%016lx\n", LEAD);
     }
-    int thread_num = omp_get_thread_num();
-    uint private_seed = (uint)(seed + thread_num);
+    else
+    {
+        PyErr_SetString(PyExc_AssertionError, "Longer width of type for hasing key needed > INT64.\n");
+        return NULL;
+    }
 
     struct timeval wtic, wtac;
     gettimeofday(&wtic, 0);
     int maxset = 0, blk = 1, nblk = 2 + ((n - 1) / NMAX);
     while (blk < nblk)
     {
+        // Start measuring time
+        struct timeval tic, tac;
+        gettimeofday(&tic, 0);
         memset(buffer, 0, buffer_size * ncol * sizeof(*buffer));
         // max node id 2,147,483,647
         int begin = (blk - 1) * NMAX, end = min(blk * NMAX, n);
+#ifdef _OPENMP
+    if (nthread > 0)
+    {
+        omp_set_num_threads(nthread);
+    }
+    int thread_num = omp_get_thread_num();
+    uint private_seed = (uint)(seed + thread_num);
 #pragma omp parallel
         {
 #pragma omp for
@@ -838,13 +979,114 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
                 dict_int *cur_item, *tmp;
                 HASH_ITER(hh, node_set, cur_item, tmp)
                 { // store node id to nidx
-                    nidx[(long)i * stride + cur_item->val] = cur_item->key;
+                    nidx[(int64_t)i * stride + cur_item->val] = cur_item->key;
                     HASH_DEL(node_set, cur_item);
                     free(cur_item);
                 }
             }
         }
+#else
+        srand(seed);
 
+        for (int i = begin; i < end; i++)
+        {
+            dict_int *node_set = NULL;
+            int offset = (i % NMAX) * stride * ncol;
+            int num_hop1 = min(Cptr[Cseq[i] + 1] - Cptr[Cseq[i]], NEBMAX);
+            buffer[offset] = num_walks;
+
+            if (num_hop1 == 0)
+            {
+                nsize[i] = 1;
+                for (int step = 1; step <= num_steps; step++)
+                {
+                    buffer[offset + step] = num_walks;
+                }
+                continue;
+            }
+
+            int num_neighs, rseq[num_hop1];
+            if (num_hop1 > num_walks)
+            {
+                int s, t;
+                for (int j = 0; j < num_hop1; j++)
+                    rseq[j] = j;
+                for (int k = 0; k < num_walks; k++)
+                {
+                    s = rand() % (num_hop1 - k) + k;
+                    t = rseq[k];
+                    rseq[k] = rseq[s];
+                    rseq[s] = t;
+                }
+            }
+
+            dict_int *root = malloc(sizeof(*root));
+            root->key = Cseq[i];
+            root->val = 0;
+            HASH_ADD_INT(node_set, key, root);
+
+            int count = 1, flag = 0;
+            for (int walk = 0; walk < num_walks; walk++)
+            {
+                int curr = Cseq[i];
+                for (int step = 0; step < num_steps; step++)
+                {
+                    if (step < 1)
+                    {
+                        if (num_hop1 <= num_walks)
+                        {
+                            curr = Cneighs[Cptr[curr] + walk % num_hop1];
+                        }
+                        else
+                        {
+                            curr = Cneighs[Cptr[curr] + rseq[walk]];
+                        }
+                    }
+                    else
+                    {
+                        num_neighs = Cptr[curr + 1] - Cptr[curr];
+                        if (num_neighs > 0)
+                        {
+                            curr = Cneighs[Cptr[curr] + (rand() % num_neighs)];
+                        }
+                    }
+
+                    int idx = find_key_int(node_set, curr);
+                    if (idx < 0)
+                    {
+                        if (count < stride)
+                        {
+                            // unique node visited by walks from the root
+                            dict_int *k = malloc(sizeof(*k));
+                            k->key = curr;
+                            k->val = count;
+                            HASH_ADD_INT(node_set, key, k);
+                            idx = count;
+                            count++;
+                        }
+                        else
+                        {
+                            flag = 1;
+                            continue;
+                        }
+                    }
+                    buffer[offset + idx * ncol + step + 1]++;
+                }
+            }
+
+            nsize[i] = count;
+            if (flag)
+                printf("#SubGAcc: key %d exceeds the buffer, try a larger bucket size > %d.\n", Cseq[i], stride);
+            // free memory
+            dict_int *cur_item, *tmp;
+            HASH_ITER(hh, node_set, cur_item, tmp)
+            { // store node id to nidx
+                nidx[(int64_t)i * stride + cur_item->val] = cur_item->key;
+                HASH_DEL(node_set, cur_item);
+                free(cur_item);
+            }
+        }
+#endif
         for (int j = begin; j < end; j++)
         {
             ncumsum[j + 1] = ncumsum[j] + nsize[j];
@@ -863,25 +1105,29 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
                 }
                 else
                 {
-                    PyErr_SetString(PyExc_MemoryError, "Failed to reallocate memory of encoding array.\n");
+                    PyErr_SetString(PyExc_MemoryError, "Failed to reallocate memory of enc array.\n");
                     return NULL;
                 }
             }
             memcpy(encoding + ncumsum[j] * ncol, buffer + (j % NMAX) * stride * ncol, nsize[j] * ncol * sizeof(*buffer));
-            memmove(nidx + ncumsum[j], nidx + (long)j * stride, nsize[j] * sizeof(*nidx));
+            memmove(nidx + ncumsum[j], nidx + (int64_t)j * stride, nsize[j] * sizeof(*nidx));
         }
+        // Stop measuring time and calculate the elapsed time
+        gettimeofday(&tac, 0);
+        double elapsed = (int64_t)(tac.tv_sec - tic.tv_sec) + (tac.tv_usec - tic.tv_usec) * 1e-6;
+        printf("run blk %d ptr %ld dt %.2fs\n", blk, ncumsum[begin], elapsed);
         blk += 1;
     }
     gettimeofday(&wtac, 0);
-    double dtw = (long)(wtac.tv_sec - wtic.tv_sec) + (wtac.tv_usec - wtic.tv_usec) * 1e-6;
-    long ntotal = ncumsum[n];
+    double dtw = (int64_t)(wtac.tv_sec - wtic.tv_sec) + (wtac.tv_usec - wtic.tv_usec) * 1e-6;
+    int64_t ntotal = ncumsum[n];
     printf("#SubGAcc: #total %ld; #max_set %d of %d; buffer usage %.2f%%; dT_w %.2fs\n", ntotal, maxset, stride, (double)ntotal / n / stride * 100, dtw);
 
     gettimeofday(&wtic, 0);
     encoding = PyMem_RawRealloc(encoding, ntotal * ncol * sizeof(*encoding));
     if (encoding == NULL)
     {
-        PyErr_SetString(PyExc_MemoryError, "Failed to resize encoding array.\n");
+        PyErr_SetString(PyExc_MemoryError, "Failed to resize enc array.\n");
         return NULL;
     }
 
@@ -897,25 +1143,8 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     Py_DECREF(OarrObj);
     nidx = (int *)PyArray_DATA(oarr);
 
-    ulong LEAD;
-    // __builtin_clz returns the number of leading 0-bits in x, starting at the most significant bit position.
-    // If x is 0, the result is undefined
-    const int SHIFT = 32 - __builtin_clz(num_walks);
-    LEAD = (ncol - 1) * SHIFT;
-    if (sizeof(ulong) * 8 >= 1 + LEAD)
-    {
-        printf("#SubGAcc: SHIFT %d, LEAD %ld, w_enc %ld, w_hash %ld ", SHIFT, LEAD, sizeof(*encoding) * 8, sizeof(ulong) * 8);
-        LEAD = (ulong)1 << LEAD;
-        printf("LEAD mask 0x%016lx\n", LEAD);
-    }
-    else
-    {
-        PyErr_SetString(PyExc_AssertionError, "Longer width of type for hasing key needed > INT64.\n");
-        return NULL;
-    }
-
-    ulong *bithash;
-    bithash = (ulong *)PyMem_RawCalloc(ntotal, sizeof(ulong));
+    uint32_t *bithash;
+    bithash = (uint32_t *)PyMem_RawCalloc(ntotal, sizeof(uint32_t));
     if (bithash == NULL)
     {
         PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for hashing.\n");
@@ -933,11 +1162,12 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
         memcpy(Cearr, encoding, ntotal * ncol * sizeof(*encoding));
     }
 
+#ifdef _OPENMP
 #pragma omp parallel
     {
 #pragma omp for
         // remap encoding to integer
-        for (long i = 0; i < ntotal; i++)
+        for (int64_t i = 0; i < ntotal; i++)
         {
             for (int j = 1; j < ncol; j++)
             {
@@ -947,6 +1177,16 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
             }
         }
     }
+#else
+    for (int64_t i = 0; i < ntotal; i++)
+    {
+        for (int j = 1; j < ncol; j++)
+        {
+            bithash[i] = bithash[i] << SHIFT;
+            bithash[i] |= encoding[i * ncol + j];
+        }
+    }
+#endif
 
     // correct landing counts for root nodes
     for (int k = 0; k < n; k++)
@@ -956,8 +1196,8 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
 
     dict_long *unique = NULL;
     int count = 0, idx;
-    ulong curr;
-    for (long i = 0; i < ntotal; i++)
+    uint32_t curr;
+    for (int64_t i = 0; i < ntotal; i++)
     {
         curr = bithash[i];
         idx = find_key_long(unique, curr);
@@ -968,10 +1208,11 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
             kh->val = count;
             HASH_ADD_LONG(unique, key, kh);
             idx = count;
-            if ((long)idx != i)
-            {
-                memmove(encoding + idx * ncol, encoding + i * ncol, ncol * sizeof(*encoding));
-            }
+            // if ((int64_t)count != i)
+            // {
+            //     memmove(encoding + count * ncol, encoding + i * ncol, ncol * sizeof(*encoding));
+            // }
+            memmove(buffer + count * ncol, encoding + i * ncol, ncol * sizeof(*encoding));
             count++;
         }
         nidx[ntotal + i] = idx;
@@ -993,7 +1234,7 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     dict_long *cur_item, *tmp;
     HASH_ITER(hh, unique, cur_item, tmp)
     {
-        memcpy(buffer + cur_item->val * ncol, encoding + cur_item->val * ncol, ncol * sizeof(*encoding));
+        // memcpy(buffer + cur_item->val * ncol, encoding + cur_item->val * ncol, ncol * sizeof(*encoding));
         HASH_DEL(unique, cur_item);
         free(cur_item);
         count--;
@@ -1005,7 +1246,7 @@ static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
     }
     PyMem_RawFree(encoding);
     gettimeofday(&wtac, 0);
-    dtw = (long)(wtac.tv_sec - wtic.tv_sec) + (wtac.tv_usec - wtic.tv_usec) * 1e-6;
+    dtw = (int64_t)(wtac.tv_sec - wtic.tv_sec) + (wtac.tv_usec - wtic.tv_usec) * 1e-6;
     printf("#SubGAcc: #enc_unique %d; compression ratio %.2f, dT_e %.2fs\n", (int)new_xdims[0], ntotal / (float)new_xdims[0], dtw);
 
     Py_DECREF(ptr);
@@ -1033,27 +1274,457 @@ fail:
     return NULL;
 }
 
-static PyMethodDef SubGAccMethods[] = {
+static PyObject *set_sampler(PyObject *self, PyObject *args, PyObject *kws)
+{
+    PyObject *arg1 = NULL, *arg2 = NULL, *query = NULL;
+    PyArrayObject *ptr = NULL, *neighs = NULL, *seq = NULL, *xarr = NULL, *oarr = NULL, *narr = NULL;
+    int num_walks = 100, num_steps = 3, seed = 111413, nthread = -1, bucket = -1, reduce = -1;
+
+    static char *kwlist[] = {"ptr", "neighs", "query", "num_walks", "num_steps", "reduce", "bucket", "nthread", "seed", NULL};
+    if (!(PyArg_ParseTupleAndKeywords(args, kws, "OOO|iiiiii", kwlist, &arg1, &arg2, &query, &num_walks, &num_steps, &reduce, &bucket, &nthread, &seed)))
+    {
+        PyErr_SetString(PyExc_TypeError, "Input parsing error.\n");
+        return NULL;
+    }
+
+    /* handle sparse matrix of adj */
+    ptr = (PyArrayObject *)PyArray_FROM_OTF(arg1, NPY_INT, NPY_ARRAY_IN_ARRAY);
+    if (!ptr)
+        return NULL;
+    int *Cptr = PyArray_DATA(ptr);
+
+    neighs = (PyArrayObject *)PyArray_FROM_OTF(arg2, NPY_INT, NPY_ARRAY_IN_ARRAY);
+    if (!neighs)
+        return NULL;
+    int *Cneighs = PyArray_DATA(neighs);
+
+    seq = (PyArrayObject *)PyArray_FROM_OTF(query, NPY_INT, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST);
+    if (!seq)
+        return NULL;
+    int *Cseq = PyArray_DATA(seq);
+
+    int n = (int)PyArray_SIZE(seq);
+    int ncol = num_steps + 1;
+    int stride = (bucket < 0) ? num_walks * num_steps + 1 : bucket;
+    // printf("n %d, stride %d, bucket %d\n", n, stride, bucket);
+
+    // create an array for compressed encoding / buffer
+    int buffer_size = min(n, NMAX) * stride;
+    npy_intp xdims[2] = {buffer_size, ncol};
+    xarr = (PyArrayObject *)PyArray_SimpleNew(2, xdims, NPY_SHORT);
+    if (xarr == NULL)
+    {
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for buffer.\n");
+        goto fail;
+    }
+    int16_t *buffer = (int16_t *)PyArray_DATA(xarr);
+
+    // create an array for storing remapped index of encoding
+    npy_intp odims[2] = {2, (int64_t)n * stride};
+    oarr = (PyArrayObject *)PyArray_EMPTY(2, odims, NPY_INT, 0);
+    int *nidx = (int *)PyArray_DATA(oarr);
+    if (oarr == NULL)
+    {
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for indexing.\n");
+        goto fail;
+    }
+
+    // create an array for storing set size
+    npy_intp ndims[1] = {n};
+    narr = (PyArrayObject *)PyArray_ZEROS(1, ndims, NPY_INT, 0);
+    if (narr == NULL)
+    {
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for storing set size.\n");
+        goto fail;
+    }
+    int *nsize = (int *)PyArray_DATA(narr);
+
+    int64_t *ncumsum;
+    ncumsum = (int64_t *)PyMem_RawMalloc((n + 1) * sizeof(int64_t));
+    ncumsum[0] = 0;
+
+#ifdef _OPENMP
+    if (nthread > 0)
+    {
+        omp_set_num_threads(nthread);
+    }
+    int thread_num = omp_get_thread_num();
+    uint private_seed = (uint)(seed + thread_num);
+#endif
+
+    uint32_t LEAD;
+    // __builtin_clz returns the number of leading 0-bits in x, starting at the most significant bit position.
+    // If x is 0, the result is undefined
+    const int SHIFT = 32 - __builtin_clz(num_walks);
+    LEAD = (ncol - 1) * SHIFT;
+    if (sizeof(uint32_t) * 8 >= 1 + LEAD)
+    {
+        printf("#SubGAcc: SHIFT %d, LEAD %ld, w_enc %ld, w_hash %ld ", SHIFT, LEAD, sizeof(*buffer) * 8, sizeof(uint32_t) * 8);
+        LEAD = (uint32_t)1 << LEAD;
+        printf("LEAD mask 0x%016lx\n", LEAD);
+    }
+    else
+    {
+        PyErr_SetString(PyExc_AssertionError, "Longer width of type for hasing key needed > INT64.\n");
+        return NULL;
+    }
+
+    dict_enc *unique = NULL;
+    int gcount = 1;
+
+    struct timeval wtic, wtac;
+    gettimeofday(&wtic, 0);
+    int maxset = 0, blk = 1, nblk = 2 + ((n - 1) / NMAX);
+    while (blk < nblk)
+    {
+        // Start measuring time
+        struct timeval tic, tac, toe;
+        gettimeofday(&tic, 0);
+        memset(buffer, 0, buffer_size * ncol * sizeof(*buffer));
+        // max node id 2,147,483,647
+        int begin = (blk - 1) * NMAX, end = min(blk * NMAX, n);
+
+#ifdef _OPENMP
+#pragma omp parallel
+        {
+#pragma omp for
+            for (int i = begin; i < end; i++)
+            {
+                dict_int *node_set = NULL;
+                int offset = (i % NMAX) * stride * ncol;
+                int num_hop1 = min(Cptr[Cseq[i] + 1] - Cptr[Cseq[i]], NEBMAX);
+                buffer[offset] = num_walks;
+
+                // if ((num_hop1 == 0) | ((num_hop1==1) & (Cseq[i] == Cneighs[Cptr[Cseq[i]]])))
+                if (num_hop1 == 0)
+                {
+                    nsize[i] = 1;
+                    for (int step = 1; step <= num_steps; step++)
+                    {
+                        buffer[offset + step] = num_walks;
+                    }
+                    continue;
+                }
+
+                int num_neighs, rseq[num_hop1];
+                if (num_hop1 > num_walks)
+                {
+                    int s, t;
+                    for (int j = 0; j < num_hop1; j++)
+                        rseq[j] = j;
+                    for (int k = 0; k < num_walks; k++)
+                    {
+                        s = rand_r(&private_seed) % (num_hop1 - k) + k;
+                        t = rseq[k];
+                        rseq[k] = rseq[s];
+                        rseq[s] = t;
+                    }
+                }
+
+                // add the root node
+                dict_int *root = malloc(sizeof(*root));
+                root->key = Cseq[i];
+                root->val = 0;
+                HASH_ADD_INT(node_set, key, root);
+
+                int count = 1, flag = 0;
+                for (int walk = 0; walk < num_walks; walk++)
+                {
+                    int curr = Cseq[i];
+                    for (int step = 0; step < num_steps; step++)
+                    {
+                        if (step < 1)
+                        {
+                            // step 0 without replacement
+                            if (num_hop1 <= num_walks)
+                            {
+                                curr = Cneighs[Cptr[curr] + walk % num_hop1];
+                            }
+                            else
+                            {
+                                curr = Cneighs[Cptr[curr] + rseq[walk]];
+                            }
+                        }
+                        else
+                        {
+                            num_neighs = Cptr[curr + 1] - Cptr[curr];
+                            if (num_neighs > 0)
+                            {
+                                curr = Cneighs[Cptr[curr] + (rand_r(&private_seed) % num_neighs)];
+                            }
+                        }
+
+                        int idx = find_key_int(node_set, curr);
+                        if (idx < 0)
+                        {
+                            if (count < stride)
+                            {
+                                // unique node visited by walks from the root
+                                dict_int *k = malloc(sizeof(*k));
+                                k->key = curr;
+                                k->val = count;
+                                HASH_ADD_INT(node_set, key, k);
+                                idx = count;
+                                count++;
+                            }
+                            else
+                            {
+                                flag = 1;
+                                continue;
+                            }
+                        }
+                        buffer[offset + idx * ncol + step + 1]++;
+                    }
+                }
+
+                nsize[i] = count;
+                if (flag)
+                    printf("#SubGAcc: key %d exceeds the buffer, try a larger bucket size > %d.\n", Cseq[i], stride);
+                // free memory
+                dict_int *cur_item, *tmp;
+                HASH_ITER(hh, node_set, cur_item, tmp)
+                { // store node id to nidx
+                    nidx[(int64_t)i * stride + cur_item->val] = cur_item->key;
+                    HASH_DEL(node_set, cur_item);
+                    free(cur_item);
+                }
+            }
+        }
+#else
+        srand(seed);
+
+        for (int i = begin; i < end; i++)
+            {
+                dict_int *node_set = NULL;
+                int offset = (i % NMAX) * stride * ncol;
+                int num_hop1 = min(Cptr[Cseq[i] + 1] - Cptr[Cseq[i]], NEBMAX);
+                buffer[offset] = num_walks;
+
+                // if ((num_hop1 == 0) | ((num_hop1==1) & (Cseq[i] == Cneighs[Cptr[Cseq[i]]])))
+                if (num_hop1 == 0)
+                {
+                    nsize[i] = 1;
+                    for (int step = 1; step <= num_steps; step++)
+                    {
+                        buffer[offset + step] = num_walks;
+                    }
+                    continue;
+                }
+
+                int num_neighs, rseq[num_hop1];
+                if (num_hop1 > num_walks)
+                {
+                    int s, t;
+                    for (int j = 0; j < num_hop1; j++)
+                        rseq[j] = j;
+                    for (int k = 0; k < num_walks; k++)
+                    {
+                        s = rand_r(&private_seed) % (num_hop1 - k) + k;
+                        t = rseq[k];
+                        rseq[k] = rseq[s];
+                        rseq[s] = t;
+                    }
+                }
+
+                // add the root node
+                dict_int *root = malloc(sizeof(*root));
+                root->key = Cseq[i];
+                root->val = 0;
+                HASH_ADD_INT(node_set, key, root);
+
+                int count = 1, flag = 0;
+                for (int walk = 0; walk < num_walks; walk++)
+                {
+                    int curr = Cseq[i];
+                    for (int step = 0; step < num_steps; step++)
+                    {
+                        if (step < 1)
+                        {
+                            // step 0 without replacement
+                            if (num_hop1 <= num_walks)
+                            {
+                                curr = Cneighs[Cptr[curr] + walk % num_hop1];
+                            }
+                            else
+                            {
+                                curr = Cneighs[Cptr[curr] + rseq[walk]];
+                            }
+                        }
+                        else
+                        {
+                            num_neighs = Cptr[curr + 1] - Cptr[curr];
+                            if (num_neighs > 0)
+                            {
+                                curr = Cneighs[Cptr[curr] + (rand_r(&private_seed) % num_neighs)];
+                            }
+                        }
+
+                        int idx = find_key_int(node_set, curr);
+                        if (idx < 0)
+                        {
+                            if (count < stride)
+                            {
+                                // unique node visited by walks from the root
+                                dict_int *k = malloc(sizeof(*k));
+                                k->key = curr;
+                                k->val = count;
+                                HASH_ADD_INT(node_set, key, k);
+                                idx = count;
+                                count++;
+                            }
+                            else
+                            {
+                                flag = 1;
+                                continue;
+                            }
+                        }
+                        buffer[offset + idx * ncol + step + 1]++;
+                    }
+                }
+
+                nsize[i] = count;
+                if (flag)
+                    printf("#SubGAcc: key %d exceeds the buffer, try a larger bucket size > %d.\n", Cseq[i], stride);
+                // free memory
+                dict_int *cur_item, *tmp;
+                HASH_ITER(hh, node_set, cur_item, tmp)
+                { // store node id to nidx
+                    nidx[(int64_t)i * stride + cur_item->val] = cur_item->key;
+                    HASH_DEL(node_set, cur_item);
+                    free(cur_item);
+                }
+            }
+#endif
+        // Stop measuring time and calculate the elapsed time
+        gettimeofday(&tac, 0);
+        double dtw = (int64_t)(tac.tv_sec - tic.tv_sec) + (tac.tv_usec - tic.tv_usec) * 1e-6;
+
+        for (int j = begin; j < end; j++)
+        {
+            int poffset = (j % NMAX) * stride;
+            ncumsum[j + 1] = ncumsum[j] + nsize[j];
+            if (nsize[j] > maxset)
+            {
+                maxset = nsize[j];
+            }
+            memmove(nidx + ncumsum[j], nidx + (int64_t)j * stride, nsize[j] * sizeof(*nidx));
+
+            for (int k = 0; k < nsize[j]; k++)
+            {
+                uint32_t bithash = 0;
+                for (int p = 1; p < ncol; p++)
+                {
+                    bithash = bithash << SHIFT;
+                    bithash |= buffer[(poffset + k) * ncol + p];
+                }
+                if (k == 0)
+                {
+                    bithash |= LEAD;
+                }
+                int idx = find_key_enc(unique, bithash);
+                if (idx < 0)
+                {
+                    dict_enc *kh = malloc(sizeof(*kh));
+                    kh->key = bithash;
+                    kh->val = gcount;
+                    memcpy(kh->enc, buffer + (poffset + k) * ncol, ncol * sizeof(*kh->enc));
+                    HASH_ADD_LONG(unique, key, kh);
+                    idx = gcount;
+                    gcount++;
+                }
+                nidx[odims[1] + ncumsum[j] + k] = idx;
+            }
+        }
+        gettimeofday(&toe, 0);
+        double dte = (int64_t)(toe.tv_sec - tac.tv_sec) + (toe.tv_usec - tac.tv_usec) * 1e-6;
+        printf("run blk %d ptr %ld dt_w %.2fs dt_e %.2fs #unique %d\n", blk, ncumsum[begin], dtw, dte, gcount);
+        blk += 1;
+    }
+    gettimeofday(&wtac, 0);
+    double wdt = (int64_t)(wtac.tv_sec - wtic.tv_sec) + (wtac.tv_usec - wtic.tv_usec) * 1e-6;
+    int64_t ntotal = ncumsum[n];
+    printf("#SubGAcc: total size %ld; max set size %d of %d; buffer usage %.2f%%; dT %.2fs\n", ntotal, maxset, stride, (double)ntotal / n / stride * 100, wdt);
+    PyMem_RawFree(ncumsum);
+
+    memmove(nidx + ntotal, nidx + odims[1], ntotal * sizeof(*nidx));
+    npy_intp new_odims[2] = {2, ntotal};
+    PyArray_Dims oadims;
+    oadims.ptr = new_odims;
+    oadims.len = 2;
+    PyObject *OarrObj = PyArray_Resize((PyArrayObject *)oarr, &oadims, 0, NPY_ANYORDER);
+    if (OarrObj == NULL)
+    {
+        goto fail;
+    }
+    Py_DECREF(OarrObj);
+    printf("#SubGAcc: enc unique size %d; compression ratio %.2f\n", gcount, ntotal / (float)gcount);
+
+    npy_intp new_xdims[2] = {gcount, ncol};
+    PyArray_Dims xadims;
+    xadims.ptr = new_xdims;
+    xadims.len = PyArray_NDIM(oarr);
+    PyObject *XarrObj = PyArray_Resize((PyArrayObject *)xarr, &xadims, 0, NPY_ANYORDER);
+    if (XarrObj == NULL)
+    {
+        goto fail;
+    }
+    Py_DECREF(XarrObj);
+    buffer = (int *)PyArray_DATA(xarr);
+    memset(buffer, 0, ncol * sizeof(*buffer));
+
+    dict_enc *cur_item, *tmp;
+    HASH_ITER(hh, unique, cur_item, tmp)
+    {
+        memcpy(buffer + cur_item->val * ncol, cur_item->enc, ncol * sizeof(*buffer));
+        HASH_DEL(unique, cur_item);
+        free(cur_item);
+        gcount--;
+    }
+    if (gcount != 1)
+    {
+        PyErr_SetString(PyExc_AssertionError, "Encoding data are corrupted.\n");
+        return NULL;
+    }
+
+    Py_DECREF(ptr);
+    Py_DECREF(neighs);
+    Py_DECREF(seq);
+    if (DEBUG)
+        f_format(xdims, (int *)buffer);
+
+    return Py_BuildValue("[N,N,N]", PyArray_Return(narr), PyArray_Return(oarr), PyArray_Return(xarr));
+fail:
+    Py_XDECREF(ptr);
+    Py_XDECREF(neighs);
+    Py_XDECREF(seq);
+    PyArray_XDECREF(narr);
+    PyArray_XDECREF(oarr);
+    PyArray_XDECREF(xarr);
+    return NULL;
+}
+
+static PyMethodDef SubGMethods[] = {
     {"add", adds, METH_VARARGS, "Addition operation."},
     {"run", exec, METH_VARARGS, "Execute a shell command."},
     {"batch_sampler", (PyCFunction)batch_sampler, METH_VARARGS | METH_KEYWORDS, "Run walk-based sampling for training queries in batches."},
     {"walk_sampler", (PyCFunction)walk_sampler, METH_VARARGS | METH_KEYWORDS, "Run random walks with relative positional encoding (RPE)."},
     {"walk_join", (PyCFunction)walk_join, METH_VARARGS | METH_KEYWORDS, "Online subgraph (walk + RPE) joining for an iterable sequence of queries."},
-    {"gset_sampler", (PyCFunction)set_sampler, METH_VARARGS | METH_KEYWORDS, "Run walk-based node set sampling with LP structure encoder."},
+    {"gset_sampler", (PyCFunction)gset_sampler, METH_VARARGS | METH_KEYWORDS, "Run walk-based node set sampling with LP structure encoder."},
+    {"set_sampler", (PyCFunction)set_sampler, METH_VARARGS | METH_KEYWORDS, "Memory efficent node set sampling with LP structure encoder."},
     {NULL, NULL, 0, NULL}};
 
-static char subgacc_doc[] = "SubGACC is an extension library based on C and openmp for accelerating subgraph operations.";
+static char subg_doc[] = "SubG is an extension library based on C and openmp for accelerating subgraph operations.";
 
-static struct PyModuleDef subgacc_module = {
+static struct PyModuleDef subg_module = {
     PyModuleDef_HEAD_INIT,
-    "subg_acc",  /* name of module */
-    subgacc_doc, /* module documentation, may be NULL */
+    "subg",  /* name of module */
+    subg_doc, /* module documentation, may be NULL */
     -1,          /* size of per-interpreter state of the module,
                 or -1 if the module keeps state in global variables. */
-    SubGAccMethods};
+    SubGMethods};
 
-PyMODINIT_FUNC PyInit_subg_acc(void)
+PyMODINIT_FUNC PyInit_subg(void)
 {
     import_array();
-    return PyModule_Create(&subgacc_module);
+    return PyModule_Create(&subg_module);
 }
